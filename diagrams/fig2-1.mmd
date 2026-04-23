@@ -1,0 +1,14 @@
+classDiagram
+    class ViewEvent {
+        +str post_id
+        +str ip
+        +str user_agent
+        +str ja4
+        +str session_id
+        +int dwell_ms
+        +int mouse_events
+    }
+    class IdentityExtractor {
+        +fingerprint(event) str
+    }
+    IdentityExtractor ..> ViewEvent : reads

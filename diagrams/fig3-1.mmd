@@ -1,0 +1,23 @@
+classDiagram
+    class Verdict {
+        <<enumeration>>
+        ACCEPT
+        SUSPICIOUS
+        REJECT
+    }
+    class Decision {
+        +Verdict decision
+        +str reason
+    }
+    class Firewall {
+        -IdentityExtractor identity
+        -dict recent
+        +evaluate(event) Decision
+    }
+    class ViewEvent {
+        +str post_id
+        +int dwell_ms
+    }
+    Firewall ..> Decision : produces
+    Decision --> Verdict : has
+    Firewall ..> ViewEvent : reads

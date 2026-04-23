@@ -1,0 +1,9 @@
+sequenceDiagram
+    participant B as NaiveBot
+    participant FW as Firewall
+    B->>B: build event (DC IP, bot UA)
+    B->>FW: evaluate(event)
+    FW->>FW: _check_static()
+    Note right of FW: IP starts with "10."
+    FW-->>B: Decision(REJECT)
+    B->>B: ignore, loop

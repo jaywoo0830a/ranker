@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant Client
+    participant FW as Firewall
+    participant ID as IdentityExtractor
+    Client->>FW: evaluate(event)
+    FW->>FW: _check_static(event)
+    Note right of FW: returns None
+    FW->>FW: _check_behavior(event)
+    Note right of FW: returns None
+    FW->>ID: fingerprint(event)
+    ID-->>FW: "a3f2..."
+    FW->>FW: _check_aggregate()
+    Note right of FW: below burst limit
+    FW-->>Client: Decision(ACCEPT)

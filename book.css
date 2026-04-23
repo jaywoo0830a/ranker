@@ -1,0 +1,176 @@
+/* Print-friendly book stylesheet.
+   Goal: look like a real book on paper. Black and white. No decoration.
+   One code block per page, one diagram per page. */
+
+@page {
+  size: A4;
+  margin: 2.2cm 2cm;
+}
+
+html {
+  font-family: Georgia, "Batang", "바탕", "Times New Roman", serif;
+  font-size: 11pt;
+  line-height: 1.55;
+  color: #000;
+  background: #fff;
+}
+
+body {
+  max-width: 17cm;
+  margin: 0 auto;
+  padding: 1em;
+}
+
+/* ---- typography ---- */
+
+h1 {
+  font-size: 22pt;
+  margin: 2em 0 0.5em 0;
+  page-break-before: always;
+  border-bottom: 2px solid #000;
+  padding-bottom: 0.2em;
+}
+
+h1:first-of-type {
+  page-break-before: avoid;
+}
+
+h2 {
+  font-size: 15pt;
+  margin: 1.8em 0 0.5em 0;
+  page-break-after: avoid;
+}
+
+h3 {
+  font-size: 12pt;
+  margin: 1.3em 0 0.4em 0;
+  page-break-after: avoid;
+}
+
+p {
+  text-align: justify;
+  margin: 0 0 0.8em 0;
+  orphans: 3;
+  widows: 3;
+}
+
+blockquote {
+  margin: 1em 1.5em;
+  font-style: italic;
+  border-left: 2px solid #000;
+  padding-left: 0.8em;
+}
+
+code {
+  font-family: "Consolas", "Courier New", monospace;
+  font-size: 10pt;
+}
+
+/* ---- code blocks occupy roughly one page ---- */
+
+.listing {
+  page-break-inside: avoid;
+  page-break-before: auto;
+  margin: 1em 0;
+  border: 1px solid #000;
+  padding: 0.8em 1em;
+  background: #fff;
+}
+
+.listing-caption {
+  font-size: 9.5pt;
+  font-style: italic;
+  margin-bottom: 0.5em;
+  border-bottom: 1px dashed #000;
+  padding-bottom: 0.3em;
+}
+
+.listing pre {
+  font-family: "Consolas", "Courier New", monospace;
+  font-size: 9.5pt;
+  line-height: 1.4;
+  white-space: pre;
+  margin: 0;
+  overflow-x: auto;
+}
+
+/* ---- diagrams occupy roughly one page ---- */
+
+.diagram {
+  page-break-inside: avoid;
+  margin: 1.2em 0;
+  padding: 0.8em;
+  border: 1px solid #000;
+  text-align: center;
+}
+
+.diagram-caption {
+  font-size: 9.5pt;
+  font-style: italic;
+  margin-top: 0.5em;
+}
+
+.mermaid {
+  background: #fff;
+  display: flex;
+  justify-content: center;
+}
+
+/* ---- TOC ---- */
+
+.toc ol {
+  list-style: none;
+  padding-left: 0;
+}
+
+.toc li {
+  margin: 0.3em 0;
+}
+
+.toc a {
+  color: #000;
+  text-decoration: none;
+}
+
+/* ---- front matter ---- */
+
+.title-page {
+  text-align: center;
+  page-break-after: always;
+  padding-top: 6em;
+}
+
+.title-page h1 {
+  font-size: 30pt;
+  border: none;
+  page-break-before: avoid;
+}
+
+.title-page .subtitle {
+  font-size: 14pt;
+  font-style: italic;
+  margin-top: 1em;
+}
+
+.title-page .author {
+  margin-top: 4em;
+  font-size: 12pt;
+}
+
+/* ---- print tuning ---- */
+
+@media print {
+  a {
+    color: #000;
+    text-decoration: none;
+  }
+  nav, .no-print {
+    display: none;
+  }
+}
+
+.book-end {
+  text-align: center;
+  margin-top: 3em;
+  font-style: italic;
+}

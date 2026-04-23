@@ -1,0 +1,22 @@
+classDiagram
+    class Bot {
+        <<abstract>>
+        -str target_post
+        -int hits
+        +attack() Iterator
+    }
+    class NaiveBot {
+        +attack() Iterator
+    }
+    class StealthBot {
+        -tuple RESIDENTIAL_PREFIXES
+        -tuple REAL_USER_AGENTS
+        +attack() Iterator
+    }
+    class ViewEvent {
+        +str post_id
+        +str ja4
+    }
+    Bot <|-- NaiveBot
+    Bot <|-- StealthBot
+    Bot ..> ViewEvent : emits
