@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 
 import yaml
@@ -11,8 +15,12 @@ from playwright.async_api import async_playwright
 from .behavior import Human
 from .event import RankQuery, RankResult
 from .identity import ContextPool
-from .manifest import Manifest, OutputMode, TargetItem, TargetSourceKind
+from .manifest import Manifest, OutputMode, PostVisit, TargetItem, TargetSourceKind
 from .search import NaverSearch
+
+
+def _log(msg: str) -> None:
+    print(f"[ranker] {msg}", file=sys.stderr, flush=True)
 
 
 def load_targets(manifest: Manifest) -> list[RankQuery]:
@@ -43,6 +51,36 @@ def _load_existing_output(path: Path) -> list[dict]:
         return []
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or []
     return data if isinstance(data, list) else []
+
+
+def _result_to_run_dict(r: RankResult) -> dict:
+    """Flatten a RankResult into the per-run YAML shape.
+
+    Optional fields (``url``, ``visit``) are omitted when absent so the disk
+    format stays compact for rank-only runs.
+    """
+    run: dict = {
+        "checked_at": r.checked_at,
+        "section": r.section,
+        "rank": r.rank,
+        "reason": r.reason,
+    }
+    if r.url is not None:
+        run["url"] = r.url
+    if r.visit is not None:
+        visit: dict = {
+            "visited_at": r.visit.visited_at,
+            "dwelled_ms": r.visit.dwelled_ms,
+        }
+        if r.visit.engagement is not None:
+            eng = r.visit.engagement
+            visit["engagement"] = {
+                "views": eng.views,
+                "likes": eng.likes,
+                "comments": eng.comments,
+            }
+        run["visit"] = visit
+    return run
 
 
 def persist_results(manifest: Manifest, results: list[RankResult]) -> None:
@@ -82,11 +120,7 @@ def persist_results(manifest: Manifest, results: list[RankResult]) -> None:
                 "runs": [],
             }
             index[key] = entry
-        entry["runs"].append({
-            "checked_at": r.checked_at,
-            "rank": r.rank,
-            "reason": r.reason,
-        })
+        entry["runs"].append(_result_to_run_dict(r))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -100,14 +134,36 @@ async def _run_once(
     search: NaverSearch,
     human: Human,
     queries: list[RankQuery],
+    post_visit: PostVisit,
 ) -> list[RankResult]:
     results: list[RankResult] = []
     await pool.begin_run()
+    total = len(queries)
     for idx, query in enumerate(queries):
+        _log(f"target {idx + 1}/{total}: '{query.keyword}' for blog_id={query.blog_id}")
         context = await pool.begin_target()
         result = await search.look_up(context, query)
+
+        if result.rank is not None:
+            _log(f"  → {result.section} rank {result.rank}")
+        else:
+            _log(f"  → not found ({result.reason})")
+
+        if post_visit.enabled and result.rank is not None and result.url:
+            _log("  visiting post, dwelling…")
+            visit = await search.visit_post(
+                context,
+                result.url,
+                post_visit.dwell_ms,
+                post_visit.mouse_events,
+                post_visit.scroll,
+            )
+            result = replace(result, visit=visit)
+            _log(f"  dwelled {visit.dwelled_ms}ms")
+
         results.append(result)
-        if idx < len(queries) - 1:
+        if idx < total - 1:
+            _log("  inter-search pause…")
             await human.inter_search_pause()
     return results
 
@@ -118,8 +174,9 @@ async def run(manifest: Manifest) -> None:
     total_runs = manifest.schedule.count
 
     async with async_playwright() as pw:
+        headless = os.environ.get("RANKER_HEADFUL", "").lower() not in ("1", "true", "yes")
         browser = await pw.chromium.launch(
-            headless=True,
+            headless=headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
         pool = ContextPool(browser, manifest.identity)
@@ -128,10 +185,19 @@ async def run(manifest: Manifest) -> None:
 
         try:
             for run_idx in range(total_runs):
-                results = await _run_once(pool, search, human, queries)
+                _log(f"run {run_idx + 1}/{total_runs}")
+                results = await _run_once(
+                    pool, search, human, queries, manifest.post_visit,
+                )
                 persist_results(manifest, results)
+                _log(f"run {run_idx + 1} persisted to {manifest.output.path}")
                 if run_idx < total_runs - 1:
+                    _log(f"sleeping {int(interval.total_seconds())}s until next run")
                     await asyncio.sleep(interval.total_seconds())
         finally:
-            await pool.close()
-            await browser.close()
+            # Ctrl-C kills the driver before these run; suppressing the
+            # inevitable "Connection closed" noise keeps exits clean.
+            with suppress(Exception):
+                await pool.close()
+            with suppress(Exception):
+                await browser.close()

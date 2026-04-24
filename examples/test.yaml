@@ -1,0 +1,54 @@
+version: 1
+
+# 빠른 e2e 검증용 매니페스트.
+# - 1회만 실행 (interval은 사용 안 됨)
+# - 사람 행동 파라미터를 최소로 낮춤 → 수십 초 안에 완료
+# - post_visit는 짧은 dwell(3~6초)로 설정 — 실제 운영 시 manifest에서 조정
+
+schedule:
+  count: 1
+  interval: 60min
+  start: immediate
+
+source:
+  kind: naver_unified_search
+  sections:
+    head:
+      type: css
+      value: div.spw_rerank._slog_visible._rra_head
+    body:
+      type: css
+      value: div.spw_rerank._slog_visible._rra_body
+  scan_depth: 10
+
+matching:
+  by: blog_id
+
+targets:
+  source: file
+  path: examples/posts.yaml
+
+output:
+  path: examples/ranks.yaml
+  mode: overwrite
+
+behavior:
+  dwell_ms:           { min: 500,  max: 1500 }
+  mouse_events:       { min: 2,    max: 4    }
+  keystroke_delay_ms: { min: 40,   max: 120  }
+  inter_search_s:     { min: 2,    max: 5    }
+
+identity:
+  locale: ko-KR
+  timezone: Asia/Seoul
+  viewport: { width: 1280, height: 800 }
+  rotate_context: per_run
+
+post_visit:
+  enabled: true
+  # 운영에선 160000~200000 (2분40초~3분20초). 여기선 빠르게 검증용.
+  dwell_ms:     { min: 3000, max: 6000 }
+  mouse_events: { min: 4,    max: 10   }
+  scroll:
+    depth_ratio: { min: 0.7, max: 0.95 }   # 글 길이의 70~95%까지 읽음
+    down_bias:   0.85                       # 스크롤 중 85%는 아래 (가끔 위로 재읽기)

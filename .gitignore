@@ -20,3 +20,4 @@ dist/
 
 # Ranker output (generated)
 examples/ranks.yaml
+debug/

@@ -95,10 +95,22 @@ class Schedule(BaseModel):
         return parse_duration(self.interval)
 
 
+class SectionLocators(BaseModel):
+    """Locators for the two blocks Naver renders in unified search.
+
+    ``head`` is the rerank-head (top highlighted) block; ``body`` is the main
+    results block. Rank is reported per section so "appeared in head" and
+    "appeared in body" stay distinguishable.
+    """
+    model_config = ConfigDict(extra="forbid")
+    head: Locator
+    body: Locator
+
+
 class Source(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: SourceKind
-    locator: Locator
+    sections: SectionLocators
     scan_depth: Annotated[int, Field(ge=1, le=100)] = 10
 
 
@@ -148,9 +160,23 @@ class IntRange(BaseModel):
         return self
 
 
+class FloatRange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    min: Annotated[float, Field(ge=0.0, le=1.0)]
+    max: Annotated[float, Field(ge=0.0, le=1.0)]
+
+    @model_validator(mode="after")
+    def _check_order(self) -> FloatRange:
+        if self.min > self.max:
+            raise ValueError(f"min ({self.min}) must be <= max ({self.max})")
+        return self
+
+
 class Behavior(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    dwell_ms: IntRange = Field(default_factory=lambda: IntRange(min=4000, max=10000))
+    # 10s floor satisfies the Firewall's behavior-layer rule (dwell >= 500ms
+    # is the bare minimum; 10s is what actually reads as human).
+    dwell_ms: IntRange = Field(default_factory=lambda: IntRange(min=10000, max=20000))
     mouse_events: IntRange = Field(default_factory=lambda: IntRange(min=5, max=15))
     keystroke_delay_ms: IntRange = Field(default_factory=lambda: IntRange(min=80, max=180))
     inter_search_s: IntRange = Field(default_factory=lambda: IntRange(min=30, max=90))
@@ -170,6 +196,41 @@ class Identity(BaseModel):
     rotate_context: RotatePolicy = RotatePolicy.PER_RUN
 
 
+class ScrollPolicy(BaseModel):
+    """How far through the page the reader scrolls.
+
+    ``depth_ratio`` : fraction of the scrollable content the reader reaches
+                      by the end of their dwell. 0.8 means "scrolled to ~80%
+                      of the post". A range lets every visit land at a
+                      slightly different finishing point.
+    ``down_bias``   : among individual scroll nudges, fraction that go DOWN.
+                      0.85 default leaves room for the occasional re-read;
+                      1.0 is monotone downward (unnatural); 0.5 is symmetric
+                      noise.
+
+    Per-nudge step size is derived automatically from ``depth_ratio``,
+    ``down_bias`` and the chosen ``mouse_events`` count — the reader ends at
+    the targeted depth with natural per-scroll jitter.
+    """
+    model_config = ConfigDict(extra="forbid")
+    depth_ratio: FloatRange = Field(default_factory=lambda: FloatRange(min=0.7, max=0.95))
+    down_bias: Annotated[float, Field(ge=0.0, le=1.0)] = 0.85
+
+
+class PostVisit(BaseModel):
+    """Optional: after a rank match, navigate to the blog post and dwell.
+
+    Engagement scraping (views / likes / comments) is a planned extension;
+    when it lands it will be an optional sub-section here so the on-disk
+    manifest stays backwards compatible.
+    """
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    dwell_ms: IntRange = Field(default_factory=lambda: IntRange(min=160000, max=200000))
+    mouse_events: IntRange = Field(default_factory=lambda: IntRange(min=20, max=60))
+    scroll: ScrollPolicy = Field(default_factory=ScrollPolicy)
+
+
 class Manifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: Literal[1]
@@ -180,6 +241,7 @@ class Manifest(BaseModel):
     matching: Matching = Field(default_factory=Matching)
     behavior: Behavior = Field(default_factory=Behavior)
     identity: Identity = Field(default_factory=Identity)
+    post_visit: PostVisit = Field(default_factory=PostVisit)
 
 
 def load_manifest(path: Path) -> Manifest:
