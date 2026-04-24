@@ -1,0 +1,9 @@
+- blog_id: example_blog
+  keyword: 강남 맛집 추천
+  title: 강남역 맛집 BEST 10
+  published_at: 2026-04-20T12:00:00+09:00
+
+- blog_id: example_blog
+  keyword: 제주 카페
+  title: 제주도 분위기 좋은 카페 모음
+  published_at: ""
