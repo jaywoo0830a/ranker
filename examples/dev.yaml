@@ -1,23 +1,18 @@
 version: 1
 
-# 개발용 매니페스트 — 프록시 없이 직접 연결.
-# 'proxy:' 블록 부재가 곧 dev 모드. 환경변수 설정 없이도 그대로 동작.
-# 운영 매니페스트는 examples/prod.yaml 참고.
-
-mode: desktop
+# 로컬 검증용 — 프록시 없이 1회 실행, 빠른 행동.
+# 실행:
+#   ranker examples/dev.yaml
+# 결과는 examples/ranks.yaml 에 기록.
+# 운영 매니페스트(병렬 4 Job + 프록시 + post_visit)는 examples/prod.yaml 참고.
 
 schedule:
   count: 1
   interval: 60min
-  start: immediate
 
 source:
   kind: naver_unified_search
   scan_depth: 10
-  # sections: 데스크탑 프로필 기본값 사용
-
-matching:
-  by: blog_id
 
 targets:
   source: file
@@ -27,18 +22,8 @@ output:
   path: examples/ranks.yaml
   mode: overwrite
 
-# proxy: 블록 없음 → 직접 연결 (dev 모드)
-
 behavior:
   dwell_ms:           { min: 500,  max: 1500 }
   mouse_events:       { min: 2,    max: 4    }
   keystroke_delay_ms: { min: 40,   max: 120  }
   inter_search_s:     { min: 2,    max: 5    }
-
-identity:
-  locale: ko-KR
-  timezone: Asia/Seoul
-  rotate_context: per_run
-
-post_visit:
-  enabled: false

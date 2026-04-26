@@ -1,24 +1,24 @@
 version: 1
 
-# 운영용 매니페스트 — ProxyEmpire 모바일 프록시 사용.
-# 실행 전 환경변수 설정 필수:
-#   export PROXYEMPIRE_USERNAME=m_xxxxxxxxxx     # 계정 stem
-#   export PROXYEMPIRE_PASSWORD=xxxxxxxxxx       # 계정 패스워드
-# 환경변수 누락 시 runner가 즉시 RuntimeError로 실패.
-
-mode: desktop
+# 운영 매니페스트 — 4 Job 병렬 (desktop 2 + mobile 2),
+# ProxyEmpire 모바일 IP, 매칭된 포스트는 post_visit dwell 수행.
+#
+# 실행 전:
+#   cp .env.example .env
+#   # .env 에서 PROXYEMPIRE_USERNAME / PROXYEMPIRE_PASSWORD 채움
+#   set -a; source .env; set +a
+#   ranker examples/prod.yaml
+#
+# 결과는 examples/ranks.yaml 에 누적 (append). 각 run dict는 job/mode 태그.
 
 schedule:
-  count: 6
-  interval: 30min
+  count: 24
+  interval: 1h
   start: immediate
 
 source:
   kind: naver_unified_search
   scan_depth: 10
-
-matching:
-  by: blog_id
 
 targets:
   source: file
@@ -35,18 +35,18 @@ proxy:
   country: kr
   session_ttl: 30m
 
+# 각 Job이 자체 sticky session → 자체 IP. 4 Job 동시 = 4 IP 동시.
+jobs:
+  - { name: desktop-1, mode: desktop }
+  - { name: desktop-2, mode: desktop }
+  - { name: mobile-1,  mode: mobile  }
+  - { name: mobile-2,  mode: mobile  }
+
 behavior:
   dwell_ms:           { min: 10000, max: 20000 }
   mouse_events:       { min: 5,     max: 15    }
   keystroke_delay_ms: { min: 80,    max: 180   }
   inter_search_s:     { min: 30,    max: 90    }
-
-identity:
-  locale: ko-KR
-  timezone: Asia/Seoul
-  # rotate_context: per_run → 매 run마다 새 BrowserContext + 새 SID + 새 IP.
-  # per_target 으로 올리면 target마다 IP가 바뀌어 더 강한 격리.
-  rotate_context: per_run
 
 post_visit:
   enabled: true

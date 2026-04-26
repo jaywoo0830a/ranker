@@ -6,6 +6,7 @@ declarative surface and the rank-matching policy are correct in isolation.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,8 @@ from ranker.manifest import (
     ProxyProvider,
     ResolvedJob,
     RotatePolicy,
+    TargetItem,
+    Targets,
     TargetSourceKind,
     load_manifest,
     parse_duration,
@@ -37,7 +40,7 @@ from ranker.proxy import (
     new_session_id,
     require_credentials,
 )
-from ranker.runner import _result_to_run_dict, persist_results
+from ranker.runner import _due_status, _result_to_run_dict, persist_results
 from ranker.search import extract_blog_id, match_rank, normalize_items
 
 
@@ -634,19 +637,19 @@ class TestExampleManifests:
         m = load_manifest(Path("examples/dev.yaml"))
         assert m.proxy is None
 
-    def test_prod_yaml_loads_with_proxy_block(self):
+    def test_prod_yaml_loads_with_proxy_and_jobs(self):
         m = load_manifest(Path("examples/prod.yaml"))
+        # prod is the canonical multi-Job + proxy + post_visit recipe; this
+        # test catches schema breakage in any of those three pieces.
         assert m.proxy is not None
         assert m.proxy.provider == ProxyProvider.PROXYEMPIRE
         assert m.proxy.country == "kr"
         assert m.proxy.session_ttl_minutes == 30
-
-    def test_jobs_yaml_loads_with_explicit_job_list(self):
-        m = load_manifest(Path("examples/jobs.yaml"))
         assert m.jobs is not None
-        assert len(m.jobs) == 4
-        names = [j.name for j in m.jobs]
-        assert names == ["desktop-1", "desktop-2", "mobile-1", "mobile-2"]
+        assert [j.name for j in m.jobs] == [
+            "desktop-1", "desktop-2", "mobile-1", "mobile-2",
+        ]
+        assert m.post_visit.enabled is True
 
 
 # ────────────────────────────────────────────────
@@ -891,3 +894,132 @@ class TestPersistResults:
         runs = out[0]["runs"]
         assert len(runs) == 2
         assert {r["job"] for r in runs} == {"d1", "m1"}
+
+
+# ────────────────────────────────────────────────
+# Published-at gating — schema + due_status policy
+# ────────────────────────────────────────────────
+
+class TestPublishedAtSchema:
+    def test_empty_published_at_is_accepted(self):
+        item = TargetItem.model_validate(
+            {"blog_id": "b", "keyword": "k", "title": "t", "published_at": ""},
+        )
+        assert item.published_at == ""
+
+    def test_iso_with_timezone_offset_is_accepted(self):
+        item = TargetItem.model_validate({
+            "blog_id": "b", "keyword": "k", "title": "t",
+            "published_at": "2026-04-27T15:00:00+09:00",
+        })
+        assert item.published_at == "2026-04-27T15:00:00+09:00"
+
+    def test_iso_with_z_suffix_is_accepted(self):
+        # Python 3.11+'s fromisoformat accepts trailing 'Z' for UTC.
+        item = TargetItem.model_validate({
+            "blog_id": "b", "keyword": "k", "title": "t",
+            "published_at": "2026-04-27T06:00:00Z",
+        })
+        assert "Z" in item.published_at
+
+    def test_naive_datetime_is_rejected(self):
+        # No timezone offset is ambiguous — refuse instead of guessing.
+        with pytest.raises(Exception, match="timezone"):
+            TargetItem.model_validate({
+                "blog_id": "b", "keyword": "k", "title": "t",
+                "published_at": "2026-04-27T15:00:00",
+            })
+
+    def test_garbage_is_rejected(self):
+        with pytest.raises(Exception):
+            TargetItem.model_validate({
+                "blog_id": "b", "keyword": "k", "title": "t",
+                "published_at": "tomorrow morning",
+            })
+
+
+class TestLookupDelayDelta:
+    def test_default_is_60min(self):
+        t = Targets.model_validate({"source": "file", "path": "x.yaml"})
+        assert t.lookup_delay_delta == timedelta(minutes=60)
+
+    def test_zero_disables_gating(self):
+        t = Targets.model_validate({
+            "source": "file", "path": "x.yaml",
+            "lookup_delay_after_published": "0s",
+        })
+        assert t.lookup_delay_delta == timedelta(0)
+
+    def test_invalid_duration_rejected(self):
+        with pytest.raises(Exception):
+            Targets.model_validate({
+                "source": "file", "path": "x.yaml",
+                "lookup_delay_after_published": "soon",
+            })
+
+
+class TestDueStatus:
+    def _query(self, published_at: str = "") -> RankQuery:
+        return RankQuery(blog_id="b", keyword="k", title="t", published_at=published_at)
+
+    def test_empty_published_at_is_always_due(self):
+        now = datetime.now(timezone.utc)
+        is_due, msg = _due_status(self._query(""), timedelta(minutes=60), now)
+        assert is_due is True
+        assert msg == ""
+
+    def test_past_publish_with_delay_already_elapsed_is_due(self):
+        # Published 2h ago, 60m delay → due 1h ago.
+        now = datetime(2026, 4, 27, 15, 0, tzinfo=timezone.utc)
+        pub = now - timedelta(hours=2)
+        is_due, _ = _due_status(self._query(pub.isoformat()), timedelta(minutes=60), now)
+        assert is_due is True
+
+    def test_recent_publish_within_delay_is_NOT_due(self):
+        # Published 30m ago, 60m delay → due 30m from now.
+        now = datetime(2026, 4, 27, 15, 0, tzinfo=timezone.utc)
+        pub = now - timedelta(minutes=30)
+        is_due, msg = _due_status(self._query(pub.isoformat()), timedelta(minutes=60), now)
+        assert is_due is False
+        assert "in 30m" in msg
+
+    def test_future_publish_is_NOT_due(self):
+        # Published 2h from now, 60m delay → due 3h from now.
+        now = datetime(2026, 4, 27, 15, 0, tzinfo=timezone.utc)
+        pub = now + timedelta(hours=2)
+        is_due, msg = _due_status(self._query(pub.isoformat()), timedelta(minutes=60), now)
+        assert is_due is False
+        assert "in 180m" in msg
+
+    def test_exact_boundary_is_due(self):
+        # now == published_at + delay → eligible.
+        pub = datetime(2026, 4, 27, 15, 0, tzinfo=timezone.utc)
+        delay = timedelta(minutes=60)
+        now = pub + delay
+        is_due, _ = _due_status(self._query(pub.isoformat()), delay, now)
+        assert is_due is True
+
+    def test_zero_delay_means_due_immediately_after_publish(self):
+        now = datetime(2026, 4, 27, 15, 0, tzinfo=timezone.utc)
+        pub = now - timedelta(seconds=1)
+        is_due, _ = _due_status(self._query(pub.isoformat()), timedelta(0), now)
+        assert is_due is True
+
+    def test_remaining_minutes_floor_at_one(self):
+        # Even ~30s remaining shouldn't show "in 0m" — that reads as "due now"
+        # to a user. Always show at least 1 minute remaining.
+        now = datetime(2026, 4, 27, 15, 0, tzinfo=timezone.utc)
+        pub = now - timedelta(minutes=59, seconds=30)
+        is_due, msg = _due_status(self._query(pub.isoformat()), timedelta(minutes=60), now)
+        assert is_due is False
+        assert "in 1m" in msg
+
+    def test_handles_kst_offset(self):
+        # Real-world publish times come with +09:00 — cross-tz comparison
+        # must work without surprises.
+        kst = timezone(timedelta(hours=9))
+        pub_kst = datetime(2026, 4, 27, 15, 0, tzinfo=kst)  # 15:00 KST = 06:00 UTC
+        # 30 min after publish in absolute terms — still inside the 60min gate.
+        now_utc = datetime(2026, 4, 27, 6, 30, tzinfo=timezone.utc)
+        is_due, _ = _due_status(self._query(pub_kst.isoformat()), timedelta(minutes=60), now_utc)
+        assert is_due is False

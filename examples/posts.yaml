@@ -1,3 +1,18 @@
+# 보고서 — 추적할 블로그 포스트 목록.
+#
+# 각 항목:
+#   blog_id      : 네이버 블로그 ID (URL의 첫 토큰; blog.naver.com/<여기>/123)
+#   keyword      : 통합검색에 입력할 검색어
+#   title        : 매칭 시 참고용 (matching.by=blog_id 면 무시됨)
+#   published_at : (선택) 발행 시각, ISO 8601 + 타임존 필수
+#                  예: "2026-04-27T15:00:00+09:00"
+#                  비어 있으면 게이팅 없음 (즉시 조회 가능).
+#                  값이 있으면 manifest의 targets.lookup_delay_after_published
+#                  (기본 60min) 만큼 지난 후부터 조회. 그 전엔 매 run마다 자동 스킵.
+#
+# 예약 발행 환경: 발행 전 포스트는 지금 추가해두고 published_at 만 넣으면
+# 알아서 발행 + 60분 후부터 조회 시작.
+
 - blog_id: wqbhdk81697
   keyword: 가경동 고등 수학학원
   title: (blog_id 매칭 중 - 실제 제목은 결과에서 확인)

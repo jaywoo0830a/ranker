@@ -136,7 +136,28 @@ class TargetItem(BaseModel):
     blog_id: str
     keyword: str
     title: str
+    # Empty → no scheduled-publish gating (target is always eligible).
+    # Otherwise must be ISO 8601 with timezone offset, e.g.
+    # ``2026-04-27T15:00:00+09:00``. Naive datetimes are rejected because
+    # mixing them with the runner's tz-aware "now" is silently wrong.
     published_at: str = ""
+
+    @field_validator("published_at")
+    @classmethod
+    def _check_iso(cls, v: str) -> str:
+        if not v:
+            return v
+        try:
+            dt = datetime.fromisoformat(v)
+        except ValueError as e:
+            raise ValueError(
+                f"published_at must be ISO 8601 datetime, got {v!r}"
+            ) from e
+        if dt.tzinfo is None:
+            raise ValueError(
+                f"published_at must include timezone offset (e.g. +09:00), got {v!r}"
+            )
+        return v
 
 
 class Targets(BaseModel):
@@ -144,6 +165,19 @@ class Targets(BaseModel):
     source: TargetSourceKind
     path: Path | None = None
     items: list[TargetItem] | None = None
+    # Skip rank lookup for any target whose ``published_at + this_delay``
+    # is still in the future. Naver needs lead time to index a freshly
+    # published post, so checking too early gets nothing but "not found"
+    # and burns a search slot. 60min is a comfortable cushion; set
+    # ``"0s"`` to disable gating entirely. Has no effect on targets with
+    # empty ``published_at``.
+    lookup_delay_after_published: str = "60min"
+
+    @field_validator("lookup_delay_after_published")
+    @classmethod
+    def _check_delay(cls, v: str) -> str:
+        parse_duration(v)
+        return v
 
     @model_validator(mode="after")
     def _require_source_fields(self) -> Targets:
@@ -152,6 +186,10 @@ class Targets(BaseModel):
         if self.source == TargetSourceKind.INLINE and not self.items:
             raise ValueError("targets.items is required when source is 'inline'")
         return self
+
+    @property
+    def lookup_delay_delta(self) -> timedelta:
+        return parse_duration(self.lookup_delay_after_published)
 
 
 class Output(BaseModel):

@@ -20,10 +20,6 @@ dist/
 
 # Ranker output (generated)
 examples/ranks.yaml
-examples/ranks_smoke.yaml
-examples/ranks_mobile.yaml
-examples/ranks_jobs.yaml
-examples/ranks_jobs_dev.yaml
 debug/
 
 # Secrets — proxy credentials live here, never in manifests.

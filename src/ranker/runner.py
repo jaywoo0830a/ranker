@@ -9,6 +9,7 @@ import random
 import sys
 from contextlib import suppress
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -214,17 +215,50 @@ async def _visit_with_retry(
         return await search.visit_post(new_ctx, url, dwell_ms, mouse_events, scroll)
 
 
+def _due_status(
+    query: RankQuery, delay: timedelta, now: datetime,
+) -> tuple[bool, str]:
+    """Return ``(is_due, message)`` for the published-at gate.
+
+    A query with empty ``published_at`` is always due (gating opted-out
+    per item). Otherwise the lookup is gated until ``published_at + delay``
+    has passed — Naver typically needs ~tens of minutes to index a fresh
+    post, so checking before then just produces "not found" noise.
+    """
+    if not query.published_at:
+        return True, ""
+    pub = datetime.fromisoformat(query.published_at)
+    due = pub + delay
+    if now >= due:
+        return True, ""
+    remaining_min = max(1, int((due - now).total_seconds() / 60))
+    return False, f"due {due.isoformat()} (in {remaining_min}m)"
+
+
 async def _run_once(
     pool: ContextPool,
     search: NaverSearch,
     human: Human,
     queries: list[RankQuery],
     post_visit: PostVisit,
+    *,
+    lookup_delay: timedelta = timedelta(0),
 ) -> list[RankResult]:
     results: list[RankResult] = []
     await pool.begin_run()
     total = len(queries)
+    now = datetime.now(timezone.utc)
     for idx, query in enumerate(queries):
+        is_due, why = _due_status(query, lookup_delay, now)
+        if not is_due:
+            _log(
+                f"target {idx + 1}/{total}: '{query.keyword}' "
+                f"for blog_id={query.blog_id} — skipping, {why}"
+            )
+            # Skipped targets produce no run entry — they'll appear in the
+            # output once a later scheduled run finds them due. Cleaner
+            # than spamming "skipped" rows for every run before publish.
+            continue
         _log(f"target {idx + 1}/{total}: '{query.keyword}' for blog_id={query.blog_id}")
         context = await pool.begin_target()
         context, result = await _look_up_with_retry(pool, search, context, query)
@@ -296,7 +330,10 @@ async def _run_one_job(
     search = NaverSearch(manifest.source, manifest.matching, human, profile)
     _log(f"mode={job.mode.value}, beginning {len(queries)} target(s)")
     try:
-        results = await _run_once(pool, search, human, queries, manifest.post_visit)
+        results = await _run_once(
+            pool, search, human, queries, manifest.post_visit,
+            lookup_delay=manifest.targets.lookup_delay_delta,
+        )
         # Serialize file writes — read-modify-write of the YAML output is
         # not safe under concurrent persists, even within asyncio. The lock
         # is held only for the brief I/O window so contention is minimal.
