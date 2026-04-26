@@ -26,3 +26,5 @@ debug/
 .env
 .env.*
 !.env.example
+
+playground
