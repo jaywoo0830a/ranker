@@ -387,6 +387,19 @@ async def run(manifest: Manifest) -> None:
     job_summary = ", ".join(f"{j.name}({j.mode.value})" for j in jobs)
     _log(f"jobs: {len(jobs)} (parallel) — {job_summary}")
 
+    # Honor scheduled start time — block until then so a manifest
+    # configured for "run at 04:00" doesn't fire the moment ranker
+    # launches at 02:30. Past start times pass through (run now).
+    if isinstance(manifest.schedule.start, datetime):
+        now = datetime.now(timezone.utc)
+        if manifest.schedule.start > now:
+            wait_s = (manifest.schedule.start - now).total_seconds()
+            _log(
+                f"waiting for schedule.start {manifest.schedule.start.isoformat()} "
+                f"(in {int(wait_s / 60)}m {int(wait_s % 60)}s)"
+            )
+            await asyncio.sleep(wait_s)
+
     output_lock = asyncio.Lock()
 
     async with async_playwright() as pw:

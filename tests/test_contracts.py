@@ -1021,6 +1021,31 @@ class TestDueStatus:
         assert is_due is False
         assert "in 1m" in msg
 
+    def test_schedule_start_immediate_passes_through(self):
+        m = Manifest.model_validate(_example_manifest_dict())
+        assert m.schedule.start == "immediate"
+
+    def test_schedule_start_iso_with_offset_parses(self):
+        data = _example_manifest_dict()
+        data["schedule"]["start"] = "2026-04-27T04:00:00+09:00"
+        m = Manifest.model_validate(data)
+        assert isinstance(m.schedule.start, datetime)
+        assert m.schedule.start.tzinfo is not None
+
+    def test_schedule_start_naive_rejected(self):
+        # Naive datetimes get silently compared against tz-aware "now" in
+        # the runner — refuse instead of guessing the offset.
+        data = _example_manifest_dict()
+        data["schedule"]["start"] = "2026-04-27T04:00:00"
+        with pytest.raises(Exception, match="timezone"):
+            Manifest.model_validate(data)
+
+    def test_schedule_start_garbage_rejected(self):
+        data = _example_manifest_dict()
+        data["schedule"]["start"] = "tomorrow morning"
+        with pytest.raises(Exception):
+            Manifest.model_validate(data)
+
     def test_handles_kst_offset(self):
         # Real-world publish times come with +09:00 — cross-tz comparison
         # must work without surprises.

@@ -108,10 +108,26 @@ class Schedule(BaseModel):
     @field_validator("start", mode="before")
     @classmethod
     def _coerce_start(cls, v):
-        if isinstance(v, datetime) or v == "immediate":
+        if isinstance(v, datetime):
+            if v.tzinfo is None:
+                raise ValueError(
+                    "schedule.start must include timezone offset, got naive datetime"
+                )
+            return v
+        if v == "immediate":
             return v
         if isinstance(v, str):
-            return datetime.fromisoformat(v)
+            try:
+                dt = datetime.fromisoformat(v)
+            except ValueError as e:
+                raise ValueError(
+                    f"schedule.start must be 'immediate' or ISO 8601 datetime, got {v!r}"
+                ) from e
+            if dt.tzinfo is None:
+                raise ValueError(
+                    f"schedule.start must include timezone offset (e.g. +09:00), got {v!r}"
+                )
+            return dt
         raise ValueError(f"invalid start: {v!r}")
 
     @property
