@@ -17,9 +17,10 @@ from __future__ import annotations
 
 from playwright.async_api import Browser, BrowserContext
 
-from .manifest import Identity, Proxy, RotatePolicy
+from .manifest import Identity, Proxy, Resources, RotatePolicy
 from .profile import ModeProfile
 from .proxy import build_proxy_arg, new_session_id
+from .resources import BlockCounter, install_blocking
 
 
 class ContextPool:
@@ -42,6 +43,7 @@ class ContextPool:
         proxy: Proxy | None = None,
         account_stem: str | None = None,
         password: str | None = None,
+        resources: Resources | None = None,
     ) -> None:
         if proxy is not None and (account_stem is None or password is None):
             raise ValueError(
@@ -54,6 +56,13 @@ class ContextPool:
         self._proxy = proxy
         self._account_stem = account_stem
         self._password = password
+        self._resources = resources
+        # One counter per pool — shared across rotations within a Job so
+        # end-of-Job totals reflect everything blocked across all contexts
+        # the Job used (e.g. a force_rotate after transient still rolls up).
+        self._counter: BlockCounter | None = (
+            BlockCounter() if resources is not None else None
+        )
         self._current: BrowserContext | None = None
         self._rotation_count = 0
 
@@ -110,4 +119,12 @@ class ContextPool:
         await self._current.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
+        if self._resources is not None:
+            assert self._counter is not None
+            await install_blocking(self._current, self._resources, self._counter)
         self._rotation_count += 1
+
+    def block_summary(self) -> str:
+        """Human-readable counter snapshot — empty string if blocking
+        was never enabled or no requests were observed."""
+        return self._counter.summary() if self._counter is not None else ""

@@ -22,7 +22,9 @@ from ranker.manifest import (
     OutputMode,
     Proxy,
     ProxyProvider,
+    Resources,
     ResolvedJob,
+    ResourceType,
     RotatePolicy,
     TargetItem,
     Targets,
@@ -39,6 +41,11 @@ from ranker.proxy import (
     is_transient_proxy_error,
     new_session_id,
     require_credentials,
+)
+from ranker.resources import (
+    BlockCounter,
+    is_tracker_host,
+    make_route_handler,
 )
 from ranker.runner import _due_status, _result_to_run_dict, persist_results
 from ranker.search import extract_blog_id, match_rank, normalize_items
@@ -1023,3 +1030,168 @@ class TestDueStatus:
         now_utc = datetime(2026, 4, 27, 6, 30, tzinfo=timezone.utc)
         is_due, _ = _due_status(self._query(pub_kst.isoformat()), timedelta(minutes=60), now_utc)
         assert is_due is False
+
+
+# ────────────────────────────────────────────────
+# Resources — schema, tracker detection, route handler
+# ────────────────────────────────────────────────
+
+class TestResourcesSchema:
+    def test_default_block_list_is_empty(self):
+        r = Resources.model_validate({})
+        assert r.block == []
+        assert r.block_third_party_trackers is False
+
+    def test_block_accepts_known_resource_types(self):
+        r = Resources.model_validate({"block": ["image", "font", "media", "stylesheet"]})
+        assert ResourceType.IMAGE in r.block
+        assert ResourceType.STYLESHEET in r.block
+
+    def test_unknown_resource_type_rejected(self):
+        # ``script`` and ``xhr`` are intentionally NOT exposed — blocking
+        # them breaks rank parsing / Naver dynamic search variants.
+        with pytest.raises(Exception):
+            Resources.model_validate({"block": ["script"]})
+        with pytest.raises(Exception):
+            Resources.model_validate({"block": ["xhr"]})
+
+    def test_unknown_field_rejected(self):
+        with pytest.raises(Exception):
+            Resources.model_validate({"block": [], "magic_setting": True})
+
+    def test_manifest_resources_field_optional(self):
+        m = Manifest.model_validate(_example_manifest_dict())
+        assert m.resources is None
+
+    def test_manifest_with_resources_block(self):
+        data = _example_manifest_dict()
+        data["resources"] = {
+            "block": ["image", "font"],
+            "block_third_party_trackers": True,
+        }
+        m = Manifest.model_validate(data)
+        assert m.resources is not None
+        assert ResourceType.IMAGE in m.resources.block
+        assert m.resources.block_third_party_trackers is True
+
+
+class TestIsTrackerHost:
+    def test_known_trackers_match(self):
+        assert is_tracker_host("https://www.googletagmanager.com/gtm.js") is True
+        assert is_tracker_host("https://stats.g.doubleclick.net/dc.js") is True
+        assert is_tracker_host("https://connect.facebook.net/en_US/fbevents.js") is True
+        assert is_tracker_host("https://b.scorecardresearch.com/p?c1=2") is True
+
+    def test_naver_first_party_does_not_match(self):
+        # Critical — we must never block naver.* even if naming overlaps.
+        assert is_tracker_host("https://search.naver.com/search.naver") is False
+        assert is_tracker_host("https://siape.veta.naver.com/log") is False
+        assert is_tracker_host("https://ssl.pstatic.net/static/blog/x.js") is False
+
+    def test_unknown_host_does_not_match(self):
+        assert is_tracker_host("https://example.com/whatever") is False
+
+    def test_malformed_url_does_not_crash(self):
+        # urlparse is forgiving; absent host returns None which we coerce to "".
+        assert is_tracker_host("not-a-url") is False
+        assert is_tracker_host("") is False
+
+
+class _FakeRequest:
+    def __init__(self, url: str, resource_type: str) -> None:
+        self.url = url
+        self.resource_type = resource_type
+
+
+class _FakeRoute:
+    def __init__(self) -> None:
+        self.action: str | None = None  # "abort" | "continue"
+
+    async def abort(self) -> None:
+        self.action = "abort"
+
+    async def continue_(self) -> None:
+        self.action = "continue"
+
+
+class TestRouteHandler:
+    @pytest.mark.asyncio
+    async def test_blocks_listed_resource_type(self):
+        counter = BlockCounter()
+        resources = Resources.model_validate({"block": ["image"]})
+        handler = make_route_handler(resources, counter)
+
+        route, req = _FakeRoute(), _FakeRequest("https://x/y.jpg", "image")
+        await handler(route, req)
+        assert route.action == "abort"
+        assert counter.blocked == 1
+        assert counter.allowed == 0
+
+    @pytest.mark.asyncio
+    async def test_passes_unlisted_resource_type(self):
+        counter = BlockCounter()
+        resources = Resources.model_validate({"block": ["image"]})
+        handler = make_route_handler(resources, counter)
+
+        route, req = _FakeRoute(), _FakeRequest("https://x/y.html", "document")
+        await handler(route, req)
+        assert route.action == "continue"
+        assert counter.allowed == 1
+        assert counter.blocked == 0
+
+    @pytest.mark.asyncio
+    async def test_blocks_tracker_when_enabled(self):
+        counter = BlockCounter()
+        resources = Resources.model_validate({
+            "block": [], "block_third_party_trackers": True,
+        })
+        handler = make_route_handler(resources, counter)
+
+        route = _FakeRoute()
+        # Even if the resource type is "script" (which we don't block by
+        # type), tracker host should still trip the abort.
+        req = _FakeRequest("https://www.googletagmanager.com/gtm.js", "script")
+        await handler(route, req)
+        assert route.action == "abort"
+        assert counter.blocked == 1
+
+    @pytest.mark.asyncio
+    async def test_passes_tracker_when_disabled(self):
+        counter = BlockCounter()
+        resources = Resources.model_validate({
+            "block": [], "block_third_party_trackers": False,
+        })
+        handler = make_route_handler(resources, counter)
+
+        route = _FakeRoute()
+        req = _FakeRequest("https://www.googletagmanager.com/gtm.js", "script")
+        await handler(route, req)
+        assert route.action == "continue"
+        assert counter.allowed == 1
+
+    @pytest.mark.asyncio
+    async def test_naver_first_party_passes_even_with_trackers_blocked(self):
+        # Critical — make sure the tracker filter never accidentally
+        # catches naver hosts.
+        counter = BlockCounter()
+        resources = Resources.model_validate({
+            "block": ["image"], "block_third_party_trackers": True,
+        })
+        handler = make_route_handler(resources, counter)
+
+        route = _FakeRoute()
+        req = _FakeRequest("https://siape.veta.naver.com/log", "xhr")
+        await handler(route, req)
+        assert route.action == "continue"
+
+
+class TestBlockCounterSummary:
+    def test_empty_returns_blank_string(self):
+        assert BlockCounter().summary() == ""
+
+    def test_summary_format(self):
+        c = BlockCounter(allowed=70, blocked=30)
+        s = c.summary()
+        assert "30" in s
+        assert "100" in s
+        assert "30%" in s

@@ -53,6 +53,20 @@ class ProxyProvider(str, Enum):
     PROXYEMPIRE = "proxyempire"
 
 
+class ResourceType(str, Enum):
+    """Subset of Playwright resource types we expose for blocking.
+
+    Limited to types whose absence doesn't break rank parsing or the
+    appearance of a real browser session — ``script`` / ``xhr`` / ``fetch``
+    are intentionally not options because Naver's dynamic search variants
+    rely on them and missing them looks bot-like.
+    """
+    IMAGE = "image"
+    FONT = "font"
+    MEDIA = "media"
+    STYLESHEET = "stylesheet"
+
+
 _DURATION_UNITS = {
     "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
     "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
@@ -329,6 +343,27 @@ class Proxy(BaseModel):
         return int(parse_duration(self.session_ttl).total_seconds() // 60)
 
 
+class Resources(BaseModel):
+    """Network-level traffic control.
+
+    When this block is omitted, every request goes through the proxy
+    (current default). When present, the listed Playwright resource types
+    are aborted at the BrowserContext layer — those requests never leave
+    Chromium, so they don't consume proxy bandwidth.
+
+    Blocking ``image``/``font``/``media`` typically cuts 30-50% of bytes
+    with no functional impact: rank parsing reads HTML anchors, not pixels;
+    post_visit dwell tracks page-open time, not pixel rendering.
+
+    ``block_third_party_trackers`` aborts requests to a curated list of
+    well-known ad/analytics hosts. First-party Naver telemetry is always
+    allowed, so the session still looks like a normal user (with adblock).
+    """
+    model_config = ConfigDict(extra="forbid")
+    block: list[ResourceType] = Field(default_factory=list)
+    block_third_party_trackers: bool = False
+
+
 class JobOverride(BaseModel):
     """Per-Job override of a small set of manifest defaults.
 
@@ -362,6 +397,9 @@ class Manifest(BaseModel):
     post_visit: PostVisit = Field(default_factory=PostVisit)
     # Absent → direct connection (dev mode). Present → proxy required.
     proxy: Proxy | None = None
+    # Absent → no resource blocking (every request reaches the proxy).
+    # Present → abort listed types at the BrowserContext layer.
+    resources: Resources | None = None
     # Absent → run as a single implicit Job using top-level config
     # (current behavior, fully backward compatible). Present → spawn one
     # Job per entry; each gets its own ContextPool / SID / IP.

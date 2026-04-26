@@ -325,6 +325,7 @@ async def _run_one_job(
         proxy=manifest.proxy,
         account_stem=account_stem,
         password=password,
+        resources=manifest.resources,
     )
     human = Human(manifest.behavior)
     search = NaverSearch(manifest.source, manifest.matching, human, profile)
@@ -344,6 +345,8 @@ async def _run_one_job(
                 manifest, results, job.name, job.mode, append_only=True,
             )
         _log(f"persisted {len(results)} target(s) to {manifest.output.path}")
+        if (block_summary := pool.block_summary()):
+            _log(block_summary)
     finally:
         with suppress(Exception):
             await pool.close()

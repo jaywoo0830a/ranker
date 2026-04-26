@@ -35,6 +35,13 @@ proxy:
   country: kr
   session_ttl: 30m
 
+# 프록시 트래픽 절감 — 페이지 단계에서 이미지/폰트/미디어/광고 트래커 차단.
+# rank 파싱과 dwell 동작에는 영향 없음 (HTML anchor + DOM 기반).
+# 차단 통계는 각 Job 종료 로그에 'blocked X of Y requests' 로 표시됨.
+resources:
+  block: [image, font, media]
+  block_third_party_trackers: true
+
 # 각 Job이 자체 sticky session → 자체 IP. 4 Job 동시 = 4 IP 동시.
 jobs:
   - { name: desktop-1, mode: desktop }
