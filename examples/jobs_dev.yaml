@@ -1,0 +1,50 @@
+version: 1
+
+# 멀티-Job 빠른 스모크 (프록시 없음).
+# - 1 run × 2 Jobs × N targets = 직렬 실행 검증용
+# - 데스크탑 + 모바일 둘 다 — Job별 profile 적용 확인
+# - dwell 짧음 → 30초~1분 안에 끝남
+#
+# 출력에서 확인할 것:
+#  - examples/ranks_jobs_dev.yaml 의 runs[] 각 항목에 'job' / 'mode' 태그
+#  - 같은 (blog_id, keyword, title) 그룹 안에 데스크탑/모바일 entry 동시 존재
+# proxy 블록 없음 → 직접 연결 (dev 모드)
+
+mode: desktop                     # 'jobs:' 항목에서 mode 미지정 시 기본값
+
+schedule:
+  count: 1
+  interval: 60min
+
+source:
+  kind: naver_unified_search
+  scan_depth: 10
+
+matching:
+  by: blog_id
+
+targets:
+  source: file
+  path: examples/posts.yaml
+
+output:
+  path: examples/ranks_jobs_dev.yaml
+  mode: overwrite
+
+jobs:
+  - { name: dev-desktop, mode: desktop }
+  - { name: dev-mobile,  mode: mobile  }
+
+behavior:
+  dwell_ms:           { min: 500,  max: 1500 }
+  mouse_events:       { min: 2,    max: 4    }
+  keystroke_delay_ms: { min: 40,   max: 120  }
+  inter_search_s:     { min: 2,    max: 5    }
+
+identity:
+  locale: ko-KR
+  timezone: Asia/Seoul
+  rotate_context: per_run
+
+post_visit:
+  enabled: false

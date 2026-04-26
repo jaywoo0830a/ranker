@@ -10,11 +10,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from playwright.async_api import BrowserContext, Frame, Page, TimeoutError as PWTimeoutError
+from playwright.async_api import BrowserContext, Frame, Page
 
 from .behavior import Human
 from .browser import (
@@ -22,10 +23,10 @@ from .browser import (
     goto_stable,
     poll_until,
     wait_for_any,
-    wait_stable,
 )
 from .event import RankQuery, RankResult, VisitResult
 from .manifest import IntRange, Locator, LocatorType, MatchBy, Matching, ScrollPolicy, Source
+from .profile import ModeProfile
 
 
 _BLOG_ID_PATTERNS = (
@@ -205,31 +206,35 @@ class NaverSearch:
     to ``body``; the reported ``section`` says which one matched.
     """
 
-    def __init__(self, source: Source, matching: Matching, human: Human) -> None:
+    def __init__(
+        self,
+        source: Source,
+        matching: Matching,
+        human: Human,
+        profile: ModeProfile,
+    ) -> None:
         self._source = source
         self._matching = matching
         self._human = human
+        self._profile = profile
+        # Sections default to the profile's preset when the manifest omits
+        # them — supports ``mode: mobile`` with no selector boilerplate.
+        self._sections = source.sections or profile.default_sections
 
     async def look_up(self, context: BrowserContext, query: RankQuery) -> RankResult:
         page = await context.new_page()
         try:
-            await goto_stable(
-                page, "https://www.naver.com/", ready_selector="input#query",
+            # Skip the homepage → type → submit dance. We navigate straight
+            # to Naver's integrated-search URL, which is where the typed
+            # form submits anyway. This keeps the flow robust across Naver
+            # UI changes and avoids the mobile overlay's fragile JS.
+            url = self._profile.search_url_template.format(
+                query=urllib.parse.quote(query.keyword),
             )
+            await goto_stable(page, url)
 
-            # Dwell on the main page before typing — the Firewall's
-            # behavior layer flags zero-dwell / zero-mouse events as bot.
-            await self._human.dwell_with_activity(page)
-
-            await self._human.type_like_human(page, "input#query", query.keyword)
-            await page.keyboard.press("Enter")
-
-            # After Enter the URL changes to search.naver.com. Wait for the
-            # new page to actually settle before looking for result blocks.
-            await wait_stable(page)
-
-            head_sel = _locator_string(self._source.sections.head)
-            body_sel = _locator_string(self._source.sections.body)
+            head_sel = _locator_string(self._sections.head)
+            body_sel = _locator_string(self._sections.body)
             if not await wait_for_any(page, (head_sel, body_sel), timeout_ms=10_000):
                 return self._miss(query, "result block not found")
 
@@ -242,16 +247,13 @@ class NaverSearch:
             head_rank, head_reason = match_rank(head_slots, query, self._matching.by)
             if head_rank is not None:
                 matched = head_slots[head_rank - 1]
-                await self._human.dwell_with_activity(page)
                 return self._hit(query, "head", head_rank, matched["url"], head_reason + " in head")
 
             body_rank, body_reason = match_rank(body_slots, query, self._matching.by)
             if body_rank is not None:
                 matched = body_slots[body_rank - 1]
-                await self._human.dwell_with_activity(page)
                 return self._hit(query, "body", body_rank, matched["url"], body_reason + " in body")
 
-            await self._human.dwell_with_activity(page)
             return self._miss(
                 query,
                 f"not found in head (top {len(head_slots)} unique blogs from {len(head_raw)} anchors) "

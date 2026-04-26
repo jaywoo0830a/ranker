@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -m pytest tests/test_contracts.py -v)",
+      "Bash(.venv/bin/python -m pytest tests/test_contracts.py)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python scripts/probe_proxy.py --help)",
+      "Bash(PROXYEMPIRE_USERNAME= PROXYEMPIRE_PASSWORD= .venv/bin/python scripts/probe_proxy.py)",
+      "Bash(.venv/bin/python scripts/probe_proxy.py examples/dev.yaml)",
+      "Bash(git check-ignore *)"
+    ]
+  }
+}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -10,6 +11,11 @@ from typing import Annotated, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class Mode(str, Enum):
+    DESKTOP = "desktop"
+    MOBILE = "mobile"
 
 
 class LocatorType(str, Enum):
@@ -41,6 +47,10 @@ class RotatePolicy(str, Enum):
     PER_RUN = "per_run"
     PER_TARGET = "per_target"
     NEVER = "never"
+
+
+class ProxyProvider(str, Enum):
+    PROXYEMPIRE = "proxyempire"
 
 
 _DURATION_UNITS = {
@@ -110,7 +120,9 @@ class SectionLocators(BaseModel):
 class Source(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: SourceKind
-    sections: SectionLocators
+    # When omitted, the active mode's profile supplies the defaults — so a
+    # simple ``mode: mobile`` manifest just works without selector copy-paste.
+    sections: SectionLocators | None = None
     scan_depth: Annotated[int, Field(ge=1, le=100)] = 10
 
 
@@ -192,7 +204,8 @@ class Identity(BaseModel):
     model_config = ConfigDict(extra="forbid")
     locale: str = "ko-KR"
     timezone: str = "Asia/Seoul"
-    viewport: Viewport = Field(default_factory=Viewport)
+    # None → the active mode's profile supplies the viewport.
+    viewport: Viewport | None = None
     rotate_context: RotatePolicy = RotatePolicy.PER_RUN
 
 
@@ -231,9 +244,76 @@ class PostVisit(BaseModel):
     scroll: ScrollPolicy = Field(default_factory=ScrollPolicy)
 
 
+class Proxy(BaseModel):
+    """Upstream HTTP proxy used for every BrowserContext.
+
+    Absence of this block in the manifest means **no proxy** — useful for
+    local development against the real network. When present, credentials
+    are loaded from environment variables (per provider), never from the
+    manifest itself, so secrets never touch disk or git.
+
+    ProxyEmpire encodes session/region into the username, so ``country``
+    and ``session_ttl`` here drive how the runtime composes the final
+    proxy username at context-rotation time.
+    """
+    model_config = ConfigDict(extra="forbid")
+    provider: ProxyProvider = ProxyProvider.PROXYEMPIRE
+    host: str
+    port: Annotated[int, Field(ge=1, le=65535)]
+    # ISO 3166-1 alpha-2 country code; ProxyEmpire matches `country-<cc>`
+    # in the username. Defaults to KR since this project targets Naver.
+    country: str = "kr"
+    # Sticky-session TTL. ProxyEmpire's documented ceiling is 60min;
+    # 30min comfortably covers a search→post-visit sequence.
+    session_ttl: str = "30m"
+
+    @field_validator("session_ttl")
+    @classmethod
+    def _check_session_ttl(cls, v: str) -> str:
+        secs = parse_duration(v).total_seconds()
+        if secs < 60:
+            raise ValueError(f"session_ttl must be at least 1 minute, got {v!r}")
+        if secs > 3600:
+            raise ValueError(
+                f"session_ttl must be at most 60 minutes (ProxyEmpire limit), got {v!r}"
+            )
+        return v
+
+    @field_validator("country")
+    @classmethod
+    def _check_country(cls, v: str) -> str:
+        if not (len(v) == 2 and v.isalpha() and v.islower()):
+            raise ValueError(f"country must be lowercase ISO 2-letter code, got {v!r}")
+        return v
+
+    @property
+    def session_ttl_minutes(self) -> int:
+        return int(parse_duration(self.session_ttl).total_seconds() // 60)
+
+
+class JobOverride(BaseModel):
+    """Per-Job override of a small set of manifest defaults.
+
+    A Job is one parallel worker — its own BrowserContext, its own sticky
+    proxy session (= its own IP), running independently from peer Jobs.
+    Anything not listed here (schedule, source, targets, matching, output,
+    proxy, ``rotate_context`` policy, etc.) is shared across all Jobs and
+    only configurable at the manifest top level.
+
+    Today the only override is ``mode`` — that covers the primary use case
+    (desktop + mobile mix in one run). Per-Job behavior/identity tweaks
+    can be added when there's a real need; keeping the surface tiny avoids
+    a five-axis merge nobody asked for.
+    """
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1)
+    mode: Mode | None = None
+
+
 class Manifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: Literal[1]
+    mode: Mode = Mode.DESKTOP
     schedule: Schedule
     source: Source
     targets: Targets
@@ -242,6 +322,54 @@ class Manifest(BaseModel):
     behavior: Behavior = Field(default_factory=Behavior)
     identity: Identity = Field(default_factory=Identity)
     post_visit: PostVisit = Field(default_factory=PostVisit)
+    # Absent → direct connection (dev mode). Present → proxy required.
+    proxy: Proxy | None = None
+    # Absent → run as a single implicit Job using top-level config
+    # (current behavior, fully backward compatible). Present → spawn one
+    # Job per entry; each gets its own ContextPool / SID / IP.
+    jobs: list[JobOverride] | None = None
+
+    @model_validator(mode="after")
+    def _check_unique_job_names(self) -> Manifest:
+        if self.jobs:
+            names = [j.name for j in self.jobs]
+            duplicates = {n for n in names if names.count(n) > 1}
+            if duplicates:
+                raise ValueError(
+                    f"job names must be unique; duplicates: {sorted(duplicates)}"
+                )
+        return self
+
+
+@dataclass(frozen=True)
+class ResolvedJob:
+    """A fully-materialized Job — manifest defaults merged with overrides.
+
+    One ResolvedJob is what a single concurrent worker actually executes.
+    Producing these via :func:`resolve_jobs` keeps the runner free of any
+    "is this an override or a default?" branching at execution time.
+    """
+    name: str
+    mode: Mode
+
+
+def resolve_jobs(manifest: Manifest) -> list[ResolvedJob]:
+    """Materialize the manifest into a list of ResolvedJob.
+
+    Backward compatibility: when ``manifest.jobs`` is absent, return a
+    single implicit Job (named ``"default"``) using the top-level config —
+    so existing single-Job manifests don't grow a ``jobs:`` block just to
+    keep working.
+    """
+    if manifest.jobs is None:
+        return [ResolvedJob(name="default", mode=manifest.mode)]
+    return [
+        ResolvedJob(
+            name=j.name,
+            mode=j.mode if j.mode is not None else manifest.mode,
+        )
+        for j in manifest.jobs
+    ]
 
 
 def load_manifest(path: Path) -> Manifest:

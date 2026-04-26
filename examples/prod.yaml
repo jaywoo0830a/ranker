@@ -1,0 +1,57 @@
+version: 1
+
+# 운영용 매니페스트 — ProxyEmpire 모바일 프록시 사용.
+# 실행 전 환경변수 설정 필수:
+#   export PROXYEMPIRE_USERNAME=m_xxxxxxxxxx     # 계정 stem
+#   export PROXYEMPIRE_PASSWORD=xxxxxxxxxx       # 계정 패스워드
+# 환경변수 누락 시 runner가 즉시 RuntimeError로 실패.
+
+mode: desktop
+
+schedule:
+  count: 6
+  interval: 30min
+  start: immediate
+
+source:
+  kind: naver_unified_search
+  scan_depth: 10
+
+matching:
+  by: blog_id
+
+targets:
+  source: file
+  path: examples/posts.yaml
+
+output:
+  path: examples/ranks.yaml
+  mode: append
+
+proxy:
+  provider: proxyempire
+  host: v2.proxyempire.io
+  port: 5000
+  country: kr
+  session_ttl: 30m
+
+behavior:
+  dwell_ms:           { min: 10000, max: 20000 }
+  mouse_events:       { min: 5,     max: 15    }
+  keystroke_delay_ms: { min: 80,    max: 180   }
+  inter_search_s:     { min: 30,    max: 90    }
+
+identity:
+  locale: ko-KR
+  timezone: Asia/Seoul
+  # rotate_context: per_run → 매 run마다 새 BrowserContext + 새 SID + 새 IP.
+  # per_target 으로 올리면 target마다 IP가 바뀌어 더 강한 격리.
+  rotate_context: per_run
+
+post_visit:
+  enabled: true
+  dwell_ms:     { min: 160000, max: 200000 }
+  mouse_events: { min: 20,     max: 60     }
+  scroll:
+    depth_ratio: { min: 0.7, max: 0.95 }
+    down_bias:   0.85
