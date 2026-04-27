@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +57,34 @@ def _config() -> tuple[Path, int]:
     return jobs_root, max_concurrent
 
 
+def _reap_orphans(jobs_root: Path) -> int:
+    """Mark stuck-running and stuck-pending jobs as failed.
+
+    Subprocesses don't survive a server restart, so any state.json that
+    still says ``running`` belongs to a dead subprocess; ``pending``
+    jobs were queued inside the previous JobManager (which is gone)
+    and will never start on their own. Both look indistinguishable
+    from a healthy active job in the UI — flipping them to ``failed``
+    with a clear error message makes the dashboard correct again and
+    tells the user to re-submit.
+
+    Returns the number of jobs reaped (zero on a clean shutdown, N
+    after a crash). The count is logged at startup so the operator
+    knows whether the previous server died mid-flight.
+    """
+    reaped = 0
+    for state in storage.list_states(jobs_root):
+        if state["status"] in ("running", "pending"):
+            storage.update_state(
+                jobs_root, state["id"],
+                status="failed",
+                completed_at=_now_iso(),
+                error="orphaned by server restart — re-submit to retry",
+            )
+            reaped += 1
+    return reaped
+
+
 # Lifespan-managed singletons. App state is held on the FastAPI app
 # rather than as module globals so test suites can spin up multiple
 # isolated apps if needed.
@@ -63,6 +92,16 @@ def _config() -> tuple[Path, int]:
 async def lifespan(app: FastAPI):
     jobs_root, max_concurrent = _config()
     app.state.jobs_root = jobs_root
+    reaped = _reap_orphans(jobs_root)
+    if reaped > 0:
+        # stderr so it shows up in uvicorn's log alongside its own
+        # startup banner; flush so it appears even if buffered.
+        print(
+            f"[ranker-service] reaped {reaped} orphaned job(s) "
+            f"from previous server lifetime",
+            file=sys.stderr,
+            flush=True,
+        )
     app.state.manager = JobManager(jobs_root, max_concurrent)
     yield
 

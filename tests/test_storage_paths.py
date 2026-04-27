@@ -287,7 +287,106 @@ class TestCacheStatsDownload:
 
         with TestClient(api.app) as c:
             res = c.get("/api/jobs/job_pending/cache-stats")
+            # Reaper flips the running state to failed at lifespan
+            # startup, so the endpoint sees a terminal job with no
+            # cache stats — still 409, just a different status in
+            # the message text.
             assert res.status_code == 409
             assert res.json()["error"] == "no_cache_stats"
         import sys
+        sys.modules.pop("ranker_service.api", None)
+
+
+# ────────────────────────────────────────────────
+# Orphan reaper — flip dead-subprocess jobs to failed at startup
+# ────────────────────────────────────────────────
+
+class TestOrphanReaper:
+    """Subprocesses don't survive a uvicorn restart. Anything left in
+    ``running``/``pending`` after the previous lifespan ended is dead;
+    the reaper flips it to ``failed`` with a clear error so the UI
+    stops showing a stuck progress bar."""
+
+    def _make(self, tmp_path: Path, job_id: str, status: str) -> Path:
+        import json as _json
+        d = tmp_path / job_id
+        d.mkdir()
+        (d / "state.json").write_text(_json.dumps({
+            "id": job_id, "name": job_id, "status": status,
+            "created_at": "2026-04-27T21:00:00+00:00",
+            "total_runs": 1, "jobs_config": [], "targets_count": 0,
+        }), encoding="utf-8")
+        return d
+
+    def _read_status(self, job_dir: Path) -> str:
+        import json as _json
+        return _json.loads((job_dir / "state.json").read_text())["status"]
+
+    def _read_state(self, job_dir: Path) -> dict:
+        import json as _json
+        return _json.loads((job_dir / "state.json").read_text())
+
+    def test_running_jobs_get_reaped_to_failed(self, tmp_path: Path):
+        from ranker_service.api import _reap_orphans
+        d = self._make(tmp_path, "job_run", "running")
+        reaped = _reap_orphans(tmp_path)
+        assert reaped == 1
+        state = self._read_state(d)
+        assert state["status"] == "failed"
+        assert "orphaned" in state["error"]
+        assert "re-submit" in state["error"]
+        # completed_at stamped so the UI can show "ended at X".
+        assert state["completed_at"]
+
+    def test_pending_jobs_get_reaped_too(self, tmp_path: Path):
+        # Pending = queued in the previous JobManager which is now
+        # gone. Without reaping, these sit in the queue forever
+        # since the new manager has empty internal state.
+        from ranker_service.api import _reap_orphans
+        d = self._make(tmp_path, "job_pend", "pending")
+        _reap_orphans(tmp_path)
+        assert self._read_status(d) == "failed"
+
+    def test_terminal_states_left_alone(self, tmp_path: Path):
+        # completed/failed/cancelled are already final — touching them
+        # would rewrite history and confuse the audit trail.
+        from ranker_service.api import _reap_orphans
+        for status in ("completed", "failed", "cancelled"):
+            d = self._make(tmp_path, f"job_{status}", status)
+            _reap_orphans(tmp_path)
+            assert self._read_status(d) == status
+
+    def test_mixed_states_reaped_correctly(self, tmp_path: Path):
+        from ranker_service.api import _reap_orphans
+        d_run = self._make(tmp_path, "job_a", "running")
+        d_pend = self._make(tmp_path, "job_b", "pending")
+        d_done = self._make(tmp_path, "job_c", "completed")
+        d_fail = self._make(tmp_path, "job_d", "failed")
+        reaped = _reap_orphans(tmp_path)
+        assert reaped == 2  # only running + pending
+        assert self._read_status(d_run) == "failed"
+        assert self._read_status(d_pend) == "failed"
+        assert self._read_status(d_done) == "completed"
+        assert self._read_status(d_fail) == "failed"
+
+    def test_empty_jobs_dir_returns_zero(self, tmp_path: Path):
+        from ranker_service.api import _reap_orphans
+        assert _reap_orphans(tmp_path) == 0
+
+    def test_lifespan_runs_reaper_on_startup(self, tmp_path: Path, monkeypatch):
+        # End-to-end: a "running" state.json in a fresh server's jobs
+        # dir is reaped before the first request lands.
+        monkeypatch.setenv("RANKER_SERVICE_JOBS_DIR", str(tmp_path))
+        self._make(tmp_path, "job_orphan", "running")
+        import importlib
+        import sys
+        sys.modules.pop("ranker_service.api", None)
+        api = importlib.import_module("ranker_service.api")
+        from fastapi.testclient import TestClient
+        with TestClient(api.app) as c:
+            res = c.get("/api/jobs/job_orphan")
+            assert res.status_code == 200
+            body = res.json()
+            assert body["status"] == "failed"
+            assert "orphaned" in body["error"]
         sys.modules.pop("ranker_service.api", None)

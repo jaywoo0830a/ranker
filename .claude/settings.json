@@ -8,7 +8,8 @@
       "Bash(PROXYEMPIRE_USERNAME= PROXYEMPIRE_PASSWORD= .venv/bin/python scripts/probe_proxy.py)",
       "Bash(.venv/bin/python scripts/probe_proxy.py examples/dev.yaml)",
       "Bash(git check-ignore *)",
-      "Bash(docker compose *)"
+      "Bash(docker compose *)",
+      "Bash(env)"
     ]
   }
 }
