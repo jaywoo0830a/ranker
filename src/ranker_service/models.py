@@ -37,6 +37,20 @@ class Progress(BaseModel):
     next_run_at: datetime | None = None
 
 
+class CacheStats(BaseModel):
+    """Disk-cache savings rolled up across all (Job × run) of one job.
+
+    The runner writes ``cache_stats.json`` at end-of-execution; the API
+    reads it lazily on every Job fetch so live polling sees the file
+    appear (and the totals grow) as runs complete.
+    """
+    total_hits: int = Field(ge=0)
+    total_misses: int = Field(ge=0)
+    total_stored: int = Field(ge=0)
+    total_bytes_saved: int = Field(ge=0)
+    hit_rate: float = Field(ge=0.0, le=1.0)
+
+
 class Job(BaseModel):
     id: str
     name: str
@@ -49,6 +63,9 @@ class Job(BaseModel):
     targets_count: int = Field(ge=0)
     queue_position: int | None = None
     error: str | None = None
+    # None until the runner writes cache_stats.json (= caching wasn't
+    # enabled, or the run hasn't reached the finally block yet).
+    cache_stats: CacheStats | None = None
 
 
 class JobSummary(BaseModel):

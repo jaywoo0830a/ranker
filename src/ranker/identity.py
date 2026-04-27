@@ -154,3 +154,18 @@ class ContextPool:
         """Human-readable cache counter snapshot — empty string if the
         cache was never enabled or no cacheable requests were seen."""
         return self._cache_counter.summary() if self._cache_counter is not None else ""
+
+    def cache_stats(self) -> dict | None:
+        """Raw cache counter as a dict for cross-Job aggregation, or
+        None if the cache was never enabled. The runner sums these
+        across all (Job × run) invocations to produce the final stats
+        file the webapp reads."""
+        if self._cache_counter is None:
+            return None
+        c = self._cache_counter
+        return {
+            "hits": c.hits,
+            "misses": c.misses,
+            "stored": c.stored,
+            "bytes_saved": c.bytes_saved,
+        }

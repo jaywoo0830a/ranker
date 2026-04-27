@@ -71,6 +71,7 @@ _DURATION_UNITS = {
     "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
     "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
     "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
 }
 
 
@@ -391,13 +392,22 @@ class Cache(BaseModel):
     # Ceiling on cached entry lifetime. Even if a server says
     # ``max-age=31536000`` we don't trust ourselves to hold a byte-exact
     # file longer than this — forces a periodic refetch so genuine
-    # upstream changes propagate within max_ttl.
-    max_ttl: str = "24h"
+    # upstream changes propagate within max_ttl. Default 7d is safe for
+    # versioned-URL CDNs (pstatic.net) where a given URL's content is
+    # effectively immutable.
+    max_ttl: str = "7d"
+    # TTL applied when a response carries no explicit ``Cache-Control:
+    # max-age``. The domain whitelist is the primary safety filter at
+    # this point — we already trust the host. Anti-cache flags
+    # (``no-store``, ``Set-Cookie``, restrictive ``Vary``) still
+    # short-circuit before this is consulted. Set ``"0s"`` to disable
+    # the heuristic and only cache responses with explicit max-age.
+    fallback_ttl: str = "1h"
     # Body size cap. Above this, skip caching to avoid pathological
     # disk usage from a misclassified response.
     max_body_kb: Annotated[int, Field(ge=1)] = 4096
 
-    @field_validator("min_ttl", "max_ttl")
+    @field_validator("min_ttl", "max_ttl", "fallback_ttl")
     @classmethod
     def _check_ttl(cls, v: str) -> str:
         parse_duration(v)
@@ -425,6 +435,10 @@ class Cache(BaseModel):
     @property
     def max_ttl_seconds(self) -> int:
         return int(parse_duration(self.max_ttl).total_seconds())
+
+    @property
+    def fallback_ttl_seconds(self) -> int:
+        return int(parse_duration(self.fallback_ttl).total_seconds())
 
 
 class Resources(BaseModel):

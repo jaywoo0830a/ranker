@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getJob, jobLogsStreamUrl } from '../api.js'
+import { getJob, jobCacheStatsUrl, jobLogsStreamUrl } from '../api.js'
 
 const POLL_MS = 5000
 const LOG_TAIL = 200
@@ -142,10 +142,42 @@ export default function JobDetail({ jobId, onClose }) {
         </dl>
       )}
 
+      {job?.cache_stats && (
+        <CacheStatsCard stats={job.cache_stats} jobId={jobId} />
+      )}
+
       <details>
         <summary>로그 (마지막 {LOG_TAIL} 라인)</summary>
         <pre>{logs || '(아직 없음)'}</pre>
       </details>
+    </section>
+  )
+}
+
+function CacheStatsCard({ stats, jobId }) {
+  const lookedUp = stats.total_hits + stats.total_misses
+  const hitRatePct = (stats.hit_rate * 100).toFixed(0)
+  const mbSaved = (stats.total_bytes_saved / (1024 * 1024)).toFixed(2)
+  return (
+    <section>
+      <h4>
+        캐시 절감{' '}
+        <a href={jobCacheStatsUrl(jobId)} download>
+          (YAML 다운로드)
+        </a>
+      </h4>
+      <dl>
+        <dt>적중률</dt>
+        <dd>
+          {stats.total_hits} / {lookedUp} ({hitRatePct}%)
+        </dd>
+
+        <dt>절감 용량</dt>
+        <dd>{mbSaved} MB</dd>
+
+        <dt>저장된 응답</dt>
+        <dd>{stats.total_stored}개</dd>
+      </dl>
     </section>
   )
 }

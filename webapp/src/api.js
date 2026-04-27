@@ -58,6 +58,13 @@ export function jobResultUrl(id) {
   return `${API_BASE}/api/jobs/${id}/result`
 }
 
+// Cache savings file (YAML), populated when the run reaches its
+// finally block. 409 until then; the link only renders after the
+// state JSON exposes a non-null ``cache_stats``.
+export function jobCacheStatsUrl(id) {
+  return `${API_BASE}/api/jobs/${id}/cache-stats`
+}
+
 // WebSocket URL for the live log stream. Picks ws:// or wss:// to match
 // the page's protocol so deployments behind HTTPS upgrade automatically.
 // In dev, Vite proxies the WS upgrade to the FastAPI server (see

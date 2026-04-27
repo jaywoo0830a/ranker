@@ -308,7 +308,7 @@ async def _run_one_job(
     job: ResolvedJob,
     account_stem: str | None,
     password: str | None,
-) -> None:
+) -> dict | None:
     """One Job's full pass over all targets, end-to-end.
 
     Owns its own ContextPool / Human / NaverSearch. Each Job reads the
@@ -319,6 +319,10 @@ async def _run_one_job(
     Started by :func:`run` via ``asyncio.gather`` with
     ``return_exceptions=True``, so any unhandled error here surfaces in
     the caller's failure list rather than tearing down peer Jobs.
+
+    Returns this Job-run's cache stats (or None when caching was off)
+    so :func:`run` can aggregate across (Job × run) and write the
+    cache_stats.json the webapp reads.
     """
     # Each Task gets its own ContextVar copy, so this only labels logs
     # from THIS Job's task — peers keep their own prefix.
@@ -365,9 +369,54 @@ async def _run_one_job(
             _log(block_summary)
         if (cache_summary := pool.cache_summary()):
             _log(cache_summary)
+        stats = pool.cache_stats()
+        if stats is not None:
+            return {"job": job.name, "mode": job.mode.value, **stats}
+        return None
     finally:
         with suppress(Exception):
             await pool.close()
+
+
+def _write_cache_stats(manifest: Manifest, per_run_stats: list[dict]) -> Path | None:
+    """Aggregate per-(Job × run) cache stats and persist next to output.
+
+    Writes ``<output_dir>/cache_stats.yaml`` with totals plus a flat
+    ``by_run`` list of per-Job entries tagged with their run index.
+    The webapp reads this file to render the savings panel; tools that
+    operate on the CLI output directory pick it up the same way. YAML
+    matches the rank-results format so a user who downloads both files
+    sees a consistent shape (and ``allow_unicode=True`` keeps Job names
+    like 'desktop-1' readable instead of escaped).
+
+    Returns the path written (or None when there were no stats — the
+    cache wasn't enabled or every Job failed before producing any).
+    """
+    if not per_run_stats:
+        return None
+    total_hits = sum(s["hits"] for s in per_run_stats)
+    total_misses = sum(s["misses"] for s in per_run_stats)
+    total_stored = sum(s["stored"] for s in per_run_stats)
+    total_bytes = sum(s["bytes_saved"] for s in per_run_stats)
+    looked_up = total_hits + total_misses
+    hit_rate = (total_hits / looked_up) if looked_up > 0 else 0.0
+
+    payload = {
+        "total_hits": total_hits,
+        "total_misses": total_misses,
+        "total_stored": total_stored,
+        "total_bytes_saved": total_bytes,
+        "hit_rate": hit_rate,
+        "by_run": per_run_stats,
+    }
+    output_dir = Path(manifest.output.path).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stats_path = output_dir / "cache_stats.yaml"
+    stats_path.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return stats_path
 
 
 def _truncate_output(manifest: Manifest) -> None:
@@ -428,6 +477,10 @@ async def run(manifest: Manifest) -> None:
         cadence_anchor = now
 
     output_lock = asyncio.Lock()
+    # One entry per (Job × run) where caching was active. Aggregated and
+    # written to cache_stats.json once all runs finish so the webapp /
+    # downstream tools can show "X MB saved across N runs".
+    per_run_stats: list[dict] = []
 
     async with async_playwright() as pw:
         headless = os.environ.get("RANKER_HEADFUL", "").lower() not in ("1", "true", "yes")
@@ -480,14 +533,35 @@ async def run(manifest: Manifest) -> None:
                 # Surface per-Job failures without tearing down the run.
                 # Transient proxy errors are already caught one level down
                 # (look_up/visit retry); anything reaching here is a real
-                # failure worth flagging.
+                # failure worth flagging. Successful Jobs return a stats
+                # dict (or None when caching was off) — collect those for
+                # the end-of-run aggregation.
                 for job, outcome in zip(jobs, outcomes):
                     if isinstance(outcome, BaseException):
                         _log(
                             f"⚠ job {job.name} failed: "
                             f"{type(outcome).__name__}: {outcome}"
                         )
+                    elif isinstance(outcome, dict):
+                        per_run_stats.append({"run": run_idx + 1, **outcome})
         finally:
+            # Aggregate cache stats across (Job × run) and persist next
+            # to output.yaml. Done in finally so a Ctrl-C mid-run still
+            # captures whatever was measured up to that point.
+            stats_path = _write_cache_stats(manifest, per_run_stats)
+            if stats_path is not None:
+                t_hits = sum(s["hits"] for s in per_run_stats)
+                t_miss = sum(s["misses"] for s in per_run_stats)
+                t_bytes = sum(s["bytes_saved"] for s in per_run_stats)
+                looked_up = t_hits + t_miss
+                pct = (t_hits * 100 / looked_up) if looked_up > 0 else 0
+                mb = t_bytes / (1024 * 1024)
+                _log(
+                    f"cache totals: {t_hits}/{looked_up} hits ({pct:.0f}%), "
+                    f"{mb:.1f}MB saved across {len(per_run_stats)} job-run(s) "
+                    f"→ {stats_path.name}"
+                )
+
             # Ctrl-C kills the driver before these run; suppressing the
             # inevitable "Connection closed" noise keeps exits clean.
             with suppress(Exception):

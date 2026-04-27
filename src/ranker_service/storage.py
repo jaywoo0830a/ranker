@@ -20,6 +20,7 @@ the JobManager read/write it through the helpers here.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shutil
@@ -38,6 +39,25 @@ def new_job_id() -> str:
 
 def job_dir(jobs_root: Path, job_id: str) -> Path:
     return jobs_root / job_id
+
+
+def shared_cache_dir(jobs_root: Path) -> Path:
+    """Server-managed cross-Job script cache root.
+
+    All Jobs spawned by this server share one disk cache, so a JS bundle
+    fetched by one Job's first run is served from disk for every other
+    Job that visits the same URL. Without this, ``cache.dir`` defaults
+    to a relative path that resolves under each Job's private cwd and
+    the cache stays per-Job (defeating the point of caching).
+
+    Configurable via ``RANKER_SERVICE_CACHE_DIR`` for ops who want
+    /var/cache/ranker or similar; defaults to a hidden directory inside
+    the jobs root so it lives on the same volume as job state.
+    """
+    override = os.environ.get("RANKER_SERVICE_CACHE_DIR")
+    if override:
+        return Path(override).resolve()
+    return (jobs_root / ".shared-cache").resolve()
 
 
 def write_state(jobs_root: Path, job_id: str, state: dict) -> None:
@@ -105,6 +125,17 @@ def save_manifest_and_posts(
     # it; we don't second-guess append vs overwrite.
     raw.setdefault("output", {})
     raw["output"]["path"] = str((d / "output.yaml").absolute())
+
+    # Steer cache.dir at a server-managed shared location so a JS bundle
+    # fetched by one Job is served from disk for every other Job that
+    # visits the same URL. Without this override, ``.ranker-cache``
+    # resolves relative to the subprocess cwd (= per-Job dir) and the
+    # cache is private — one fetch per Job per URL, defeating the point.
+    # We only inject this when the user opted in to caching; manifests
+    # without a ``resources.cache`` block stay untouched.
+    resources = raw.get("resources")
+    if isinstance(resources, dict) and isinstance(resources.get("cache"), dict):
+        resources["cache"]["dir"] = str(shared_cache_dir(jobs_root))
 
     manifest_path = d / "manifest.yaml"
     manifest_path.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")

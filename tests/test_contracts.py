@@ -56,6 +56,7 @@ from ranker.runner import (
     _due_status,
     _result_to_run_dict,
     _slot_delay,
+    _write_cache_stats,
     persist_results,
 )
 from ranker.search import extract_blog_id, match_rank, normalize_items
@@ -77,6 +78,13 @@ class TestParseDuration:
 
     def test_compound(self):
         assert parse_duration("1h30m").total_seconds() == 5400
+
+    def test_days(self):
+        # ``d`` was added so cache.max_ttl can be expressed as ``7d``
+        # without forcing the user to write 168h.
+        assert parse_duration("7d").total_seconds() == 7 * 86400
+        assert parse_duration("1day").total_seconds() == 86400
+        assert parse_duration("2days").total_seconds() == 2 * 86400
 
     def test_unknown_unit_rejected(self):
         with pytest.raises(ValueError):
@@ -1248,7 +1256,13 @@ class TestCacheSchema:
         assert c.enabled is False
         assert c.domains == ["pstatic.net"]
         assert c.min_ttl == "1m"
-        assert c.max_ttl == "24h"
+        # 7d: pstatic versioned URLs are immutable; longer cap means
+        # more cross-day reuse before forced refresh.
+        assert c.max_ttl == "7d"
+        # Heuristic ON by default — pstatic responses without explicit
+        # max-age get cached for an hour. Domain whitelist is the
+        # primary safety filter.
+        assert c.fallback_ttl == "1h"
 
     def test_enabled_with_custom_domains(self):
         c = Cache.model_validate({
@@ -1281,6 +1295,20 @@ class TestCacheSchema:
         c = Cache.model_validate({"min_ttl": "30s", "max_ttl": "2h"})
         assert c.min_ttl_seconds == 30
         assert c.max_ttl_seconds == 7200
+
+    def test_fallback_ttl_seconds(self):
+        c = Cache.model_validate({"fallback_ttl": "2h"})
+        assert c.fallback_ttl_seconds == 7200
+
+    def test_fallback_ttl_zero_disables_heuristic(self):
+        # ``"0s"`` is the strict-mode opt-out — only cache responses
+        # that carry an explicit Cache-Control: max-age.
+        c = Cache.model_validate({"fallback_ttl": "0s"})
+        assert c.fallback_ttl_seconds == 0
+
+    def test_fallback_ttl_garbage_rejected(self):
+        with pytest.raises(Exception):
+            Cache.model_validate({"fallback_ttl": "soon"})
 
     def test_resources_default_has_no_cache(self):
         r = Resources.model_validate({})
@@ -1340,10 +1368,44 @@ class TestIsCacheableResponse:
         assert ok is True
         assert ttl == 600
 
-    def test_no_cache_control_header_is_not_cacheable(self):
-        ok, ttl = _is_cacheable_response({"content-type": "application/javascript"})
+    def test_no_cache_control_header_is_not_cacheable_in_strict_mode(self):
+        # fallback_ttl=0 = strict: require explicit max-age.
+        ok, ttl = _is_cacheable_response(
+            {"content-type": "application/javascript"}, fallback_ttl=0,
+        )
         assert ok is False
         assert ttl == 0
+
+    def test_no_cache_control_with_fallback_ttl_caches_for_fallback(self):
+        # Heuristic mode: domain whitelist is the primary filter, and
+        # the absence of any anti-cache header means it's safe to cache
+        # for the fallback duration.
+        ok, ttl = _is_cacheable_response(
+            {"content-type": "application/javascript"}, fallback_ttl=3600,
+        )
+        assert ok is True
+        assert ttl == 3600
+
+    def test_no_store_refused_even_with_fallback(self):
+        # Anti-cache flags still short-circuit when fallback is on.
+        ok, _ = _is_cacheable_response(
+            {"cache-control": "no-store"}, fallback_ttl=3600,
+        )
+        assert ok is False
+
+    def test_set_cookie_refused_even_with_fallback(self):
+        ok, _ = _is_cacheable_response(
+            {"set-cookie": "session=abc"}, fallback_ttl=3600,
+        )
+        assert ok is False
+
+    def test_explicit_max_age_wins_over_fallback(self):
+        # When both are present, server's explicit value is authoritative.
+        ok, ttl = _is_cacheable_response(
+            {"cache-control": "max-age=900"}, fallback_ttl=3600,
+        )
+        assert ok is True
+        assert ttl == 900
 
     def test_no_store_refused(self):
         ok, _ = _is_cacheable_response({"cache-control": "no-store, max-age=600"})
@@ -1608,3 +1670,80 @@ class TestSlotDelay:
         now = anchor + timedelta(minutes=60)
         delta = _slot_delay(anchor, timedelta(minutes=30), 2, now)
         assert delta == 0.0
+
+
+# ────────────────────────────────────────────────
+# cache_stats.json aggregation
+# ────────────────────────────────────────────────
+
+class TestWriteCacheStats:
+    """``_write_cache_stats`` is the only point in the runner that
+    persists the savings measurement. The webapp/CLI both consume the
+    file format it produces — pin the shape and totals here so a
+    refactor can't silently change either."""
+
+    def _manifest(self, tmp_path: Path):
+        from ranker.manifest import Manifest
+        return Manifest.model_validate({
+            "version": 1,
+            "schedule": {"count": 1, "interval": "1h", "start": "immediate"},
+            "source": {"kind": "naver_unified_search"},
+            "targets": {
+                "source": "inline",
+                "items": [{"blog_id": "b", "keyword": "k", "title": "t"}],
+            },
+            "output": {"path": str(tmp_path / "out.yaml"), "mode": "append"},
+        })
+
+    def test_no_stats_writes_no_file(self, tmp_path: Path):
+        # Cache off → no Job returned a stats dict → nothing to write.
+        m = self._manifest(tmp_path)
+        path = _write_cache_stats(m, [])
+        assert path is None
+        assert not (tmp_path / "cache_stats.yaml").exists()
+
+    def test_aggregates_across_jobs_and_runs(self, tmp_path: Path):
+        m = self._manifest(tmp_path)
+        per_run = [
+            {"run": 1, "job": "desktop-1", "mode": "desktop",
+             "hits": 10, "misses": 2, "stored": 2, "bytes_saved": 1024},
+            {"run": 1, "job": "mobile-1", "mode": "mobile",
+             "hits": 8, "misses": 4, "stored": 4, "bytes_saved": 2048},
+            {"run": 2, "job": "desktop-1", "mode": "desktop",
+             "hits": 12, "misses": 0, "stored": 0, "bytes_saved": 3072},
+        ]
+        path = _write_cache_stats(m, per_run)
+        # File is YAML — same shape as the rank results next to it.
+        assert path == tmp_path / "cache_stats.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["total_hits"] == 30
+        assert data["total_misses"] == 6
+        assert data["total_stored"] == 6
+        assert data["total_bytes_saved"] == 6144
+        # 30 / 36 ≈ 0.833
+        assert 0.83 < data["hit_rate"] < 0.84
+        assert len(data["by_run"]) == 3
+
+    def test_yaml_preserves_field_order_for_human_readers(self, tmp_path: Path):
+        # Totals first, then by_run last — so a downloaded file reads
+        # naturally from top to bottom (summary above details).
+        m = self._manifest(tmp_path)
+        path = _write_cache_stats(m, [
+            {"run": 1, "job": "j", "mode": "desktop",
+             "hits": 5, "misses": 1, "stored": 1, "bytes_saved": 512},
+        ])
+        text = path.read_text(encoding="utf-8")
+        # Naive but informative: totals appear before "by_run:" line.
+        assert text.index("total_hits") < text.index("by_run")
+
+    def test_zero_lookups_yields_zero_hit_rate(self, tmp_path: Path):
+        # A Job that was configured for caching but never made a
+        # cacheable request still records its zero stats — guard
+        # against divide-by-zero.
+        m = self._manifest(tmp_path)
+        path = _write_cache_stats(m, [
+            {"run": 1, "job": "j", "mode": "desktop",
+             "hits": 0, "misses": 0, "stored": 0, "bytes_saved": 0},
+        ])
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["hit_rate"] == 0.0

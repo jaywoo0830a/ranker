@@ -124,15 +124,21 @@ def _is_cacheable_request(request: Request, domains: frozenset[str]) -> bool:
 _MAX_AGE_RE = re.compile(r"max-age\s*=\s*(\d+)")
 
 
-def _is_cacheable_response(headers: dict[str, str]) -> tuple[bool, int]:
+def _is_cacheable_response(
+    headers: dict[str, str], fallback_ttl: int = 0,
+) -> tuple[bool, int]:
     """Gate at the response side. Returns ``(cacheable, ttl_seconds)``.
 
     Strictly respects HTTP caching semantics:
     - ``no-store``/``no-cache``/``private``/``must-revalidate`` → refuse
-    - require explicit ``max-age=N``; no heuristic freshness
     - ``Set-Cookie`` → refuse (response is user-specific)
     - ``Vary`` other than ``Accept-Encoding`` → refuse (we'd need to key
       on the varying header, which we don't)
+    - explicit ``max-age=N`` → cache for N seconds
+    - no ``max-age`` and ``fallback_ttl > 0`` → cache for fallback_ttl
+      (heuristic; relies on the caller having already gated by domain
+      whitelist as the primary safety filter)
+    - no ``max-age`` and ``fallback_ttl == 0`` → refuse (strict mode)
     """
     # Header lookup is case-insensitive; Playwright's all_headers() returns
     # lowercased keys, but we normalize defensively in case that changes.
@@ -143,11 +149,6 @@ def _is_cacheable_response(headers: dict[str, str]) -> tuple[bool, int]:
         if forbidden in cc:
             return False, 0
 
-    m = _MAX_AGE_RE.search(cc)
-    if not m:
-        return False, 0
-    ttl = int(m.group(1))
-
     if "set-cookie" in norm:
         return False, 0
 
@@ -157,7 +158,17 @@ def _is_cacheable_response(headers: dict[str, str]) -> tuple[bool, int]:
         if any(p != "accept-encoding" for p in parts):
             return False, 0
 
-    return True, ttl
+    m = _MAX_AGE_RE.search(cc)
+    if m:
+        return True, int(m.group(1))
+
+    # No explicit max-age. Fall back to the configured TTL when the
+    # caller asked for heuristic mode — by this point we've already
+    # rejected every "do not cache" signal a server can send, and the
+    # request-side filter has narrowed us to a trusted domain.
+    if fallback_ttl > 0:
+        return True, fallback_ttl
+    return False, 0
 
 
 class DiskCache:
@@ -183,17 +194,23 @@ class DiskCache:
         min_ttl_seconds: int,
         max_ttl_seconds: int,
         max_body_bytes: int,
+        fallback_ttl_seconds: int = 0,
     ) -> None:
         self._root = Path(root)
         self._domains = frozenset(domains)
         self._min_ttl = min_ttl_seconds
         self._max_ttl = max_ttl_seconds
         self._max_body = max_body_bytes
+        self._fallback_ttl = fallback_ttl_seconds
         self._root.mkdir(parents=True, exist_ok=True)
 
     @property
     def domains(self) -> frozenset[str]:
         return self._domains
+
+    @property
+    def fallback_ttl_seconds(self) -> int:
+        return self._fallback_ttl
 
     def _paths(self, url: str) -> tuple[Path, Path]:
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
@@ -270,6 +287,7 @@ def build_cache(spec: Cache) -> DiskCache:
         min_ttl_seconds=spec.min_ttl_seconds,
         max_ttl_seconds=spec.max_ttl_seconds,
         max_body_bytes=spec.max_body_kb * 1024,
+        fallback_ttl_seconds=spec.fallback_ttl_seconds,
     )
 
 
@@ -350,7 +368,9 @@ def _make_response_listener(cache: DiskCache, counter: CacheCounter):
             if cache.has_fresh(request.url):
                 return
             headers = await response.all_headers()
-            cacheable, ttl = _is_cacheable_response(headers)
+            cacheable, ttl = _is_cacheable_response(
+                headers, fallback_ttl=cache.fallback_ttl_seconds,
+            )
             if not cacheable:
                 return
             body = await response.body()

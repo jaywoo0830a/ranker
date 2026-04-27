@@ -34,6 +34,7 @@ from ranker.manifest import resolve_jobs
 from . import storage
 from .jobs import JobManager, _now_iso
 from .models import (
+    CacheStats,
     ConcurrencyInfo,
     Job,
     JobConfig,
@@ -110,6 +111,32 @@ def _progress_from_state(state: dict) -> Progress:
     )
 
 
+def _cache_stats_for(job_id: str) -> CacheStats | None:
+    """Read the runner-written cache_stats.yaml if it exists yet.
+
+    Returns None when the file is absent (caching wasn't enabled, or
+    the run hasn't reached its finally block) or unreadable. We don't
+    surface a parse error to the client — better to show "no stats yet"
+    than an error on a perfectly valid Job.
+    """
+    path = storage.job_dir(_jobs_root(), job_id) / "cache_stats.yaml"
+    if not path.exists():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        return CacheStats(
+            total_hits=data["total_hits"],
+            total_misses=data["total_misses"],
+            total_stored=data["total_stored"],
+            total_bytes_saved=data["total_bytes_saved"],
+            hit_rate=data["hit_rate"],
+        )
+    except (OSError, yaml.YAMLError, KeyError, TypeError):
+        return None
+
+
 def _state_to_summary(state: dict, queue_position: int | None) -> JobSummary:
     return JobSummary(
         id=state["id"],
@@ -134,6 +161,7 @@ def _state_to_job(state: dict, queue_position: int | None) -> Job:
         targets_count=state.get("targets_count", 0),
         queue_position=queue_position,
         error=state.get("error"),
+        cache_stats=_cache_stats_for(state["id"]),
     )
 
 
@@ -259,6 +287,32 @@ async def get_job_result(job_id: str):
         output_path,
         media_type="application/yaml",
         filename=f"ranks_{job_id}.yaml",
+    )
+
+
+@app.get("/api/jobs/{job_id}/cache-stats")
+async def get_job_cache_stats(job_id: str):
+    """Download the cache savings file (YAML) the runner wrote.
+
+    Mirrors ``/result`` so a user who clicks "결과" and "캐시 통계"
+    gets two files of the same shape. ``cache_stats.yaml`` is written
+    by the runner's ``finally`` block, so it's available the moment
+    a Job leaves "running" — even on cancel/fail.
+    """
+    state = storage.read_state(_jobs_root(), job_id)
+    if state is None:
+        return _not_found(job_id)
+    stats_path = storage.job_dir(_jobs_root(), job_id) / "cache_stats.yaml"
+    if not stats_path.exists():
+        return _err(
+            409, "no_cache_stats",
+            f"job {job_id} has no cache stats "
+            f"(caching off or run hasn't completed yet, status={state['status']})",
+        )
+    return FileResponse(
+        stats_path,
+        media_type="application/yaml",
+        filename=f"cache_stats_{job_id}.yaml",
     )
 
 
