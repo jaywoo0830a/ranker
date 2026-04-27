@@ -20,7 +20,13 @@ from playwright.async_api import Browser, BrowserContext
 from .manifest import Identity, Proxy, Resources, RotatePolicy
 from .profile import ModeProfile
 from .proxy import build_proxy_arg, new_session_id
-from .resources import BlockCounter, install_blocking
+from .resources import (
+    BlockCounter,
+    CacheCounter,
+    DiskCache,
+    build_cache,
+    install_blocking,
+)
 
 
 class ContextPool:
@@ -63,6 +69,18 @@ class ContextPool:
         self._counter: BlockCounter | None = (
             BlockCounter() if resources is not None else None
         )
+        # Disk cache is built once and shared across rotations + Jobs:
+        # the on-disk store is the unit of sharing, the in-memory handle
+        # just points at it. Counter is per-Job for end-of-Job reporting.
+        self._cache: DiskCache | None = None
+        self._cache_counter: CacheCounter | None = None
+        if (
+            resources is not None
+            and resources.cache is not None
+            and resources.cache.enabled
+        ):
+            self._cache = build_cache(resources.cache)
+            self._cache_counter = CacheCounter()
         self._current: BrowserContext | None = None
         self._rotation_count = 0
 
@@ -121,10 +139,18 @@ class ContextPool:
         )
         if self._resources is not None:
             assert self._counter is not None
-            await install_blocking(self._current, self._resources, self._counter)
+            await install_blocking(
+                self._current, self._resources, self._counter,
+                self._cache, self._cache_counter,
+            )
         self._rotation_count += 1
 
     def block_summary(self) -> str:
         """Human-readable counter snapshot — empty string if blocking
         was never enabled or no requests were observed."""
         return self._counter.summary() if self._counter is not None else ""
+
+    def cache_summary(self) -> str:
+        """Human-readable cache counter snapshot — empty string if the
+        cache was never enabled or no cacheable requests were seen."""
+        return self._cache_counter.summary() if self._cache_counter is not None else ""

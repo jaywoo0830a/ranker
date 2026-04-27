@@ -15,6 +15,7 @@ import yaml
 from ranker.event import RankQuery
 from ranker.event import Engagement, RankResult, VisitResult
 from ranker.manifest import (
+    Cache,
     JobOverride,
     MatchBy,
     Manifest,
@@ -44,6 +45,10 @@ from ranker.proxy import (
 )
 from ranker.resources import (
     BlockCounter,
+    CacheCounter,
+    DiskCache,
+    _is_cacheable_request,
+    _is_cacheable_response,
     is_tracker_host,
     make_route_handler,
 )
@@ -657,6 +662,12 @@ class TestExampleManifests:
             "desktop-1", "desktop-2", "mobile-1", "mobile-2",
         ]
         assert m.post_visit.enabled is True
+        # cache enabled on the static-CDN whitelist — guards against
+        # accidental deletion of the cache block from the canonical manifest.
+        assert m.resources is not None
+        assert m.resources.cache is not None
+        assert m.resources.cache.enabled is True
+        assert "pstatic.net" in m.resources.cache.domains
 
 
 # ────────────────────────────────────────────────
@@ -1220,3 +1231,307 @@ class TestBlockCounterSummary:
         assert "30" in s
         assert "100" in s
         assert "30%" in s
+
+
+# ────────────────────────────────────────────────
+# Cache schema
+# ────────────────────────────────────────────────
+
+class TestCacheSchema:
+    def test_default_is_disabled(self):
+        c = Cache.model_validate({})
+        assert c.enabled is False
+        assert c.domains == ["pstatic.net"]
+        assert c.min_ttl == "1m"
+        assert c.max_ttl == "24h"
+
+    def test_enabled_with_custom_domains(self):
+        c = Cache.model_validate({
+            "enabled": True,
+            "domains": ["pstatic.net", "example.cdn"],
+        })
+        assert c.enabled is True
+        assert "example.cdn" in c.domains
+
+    def test_empty_domains_rejected(self):
+        # Empty whitelist would be useless — would never match, just
+        # spending CPU on the check. Schema refuses so misconfiguration
+        # surfaces at load time, not silently as zero hits.
+        with pytest.raises(Exception):
+            Cache.model_validate({"enabled": True, "domains": []})
+
+    def test_inverted_ttl_range_rejected(self):
+        with pytest.raises(Exception, match="min_ttl"):
+            Cache.model_validate({"min_ttl": "2h", "max_ttl": "1h"})
+
+    def test_garbage_ttl_rejected(self):
+        with pytest.raises(Exception):
+            Cache.model_validate({"min_ttl": "soon"})
+
+    def test_unknown_field_rejected(self):
+        with pytest.raises(Exception):
+            Cache.model_validate({"enabled": True, "magic": 1})
+
+    def test_ttl_seconds_properties(self):
+        c = Cache.model_validate({"min_ttl": "30s", "max_ttl": "2h"})
+        assert c.min_ttl_seconds == 30
+        assert c.max_ttl_seconds == 7200
+
+    def test_resources_default_has_no_cache(self):
+        r = Resources.model_validate({})
+        assert r.cache is None
+
+    def test_resources_with_cache_block(self):
+        r = Resources.model_validate({
+            "block": ["image"],
+            "cache": {"enabled": True},
+        })
+        assert r.cache is not None
+        assert r.cache.enabled is True
+
+
+# ────────────────────────────────────────────────
+# DiskCache — request/response gates
+# ────────────────────────────────────────────────
+
+class _FakeCacheRequest:
+    def __init__(self, url: str, resource_type: str = "script", method: str = "GET"):
+        self.url = url
+        self.resource_type = resource_type
+        self.method = method
+
+
+class TestIsCacheableRequest:
+    def setup_method(self):
+        self.domains = frozenset({"pstatic.net"})
+
+    def test_get_script_on_whitelisted_domain_passes(self):
+        req = _FakeCacheRequest("https://ssl.pstatic.net/static/blog/x.js")
+        assert _is_cacheable_request(req, self.domains) is True
+
+    def test_post_rejected_even_if_otherwise_cacheable(self):
+        req = _FakeCacheRequest(
+            "https://ssl.pstatic.net/x.js", method="POST",
+        )
+        assert _is_cacheable_request(req, self.domains) is False
+
+    def test_non_script_resource_rejected(self):
+        # XHR / document / fetch must always be fresh — they carry rank
+        # data we cannot serve from cache.
+        for rt in ("xhr", "fetch", "document", "image", "stylesheet"):
+            req = _FakeCacheRequest(
+                "https://ssl.pstatic.net/x.js", resource_type=rt,
+            )
+            assert _is_cacheable_request(req, self.domains) is False, rt
+
+    def test_offlist_domain_rejected(self):
+        req = _FakeCacheRequest("https://search.naver.com/main.js")
+        assert _is_cacheable_request(req, self.domains) is False
+
+
+class TestIsCacheableResponse:
+    def test_basic_max_age_is_cacheable(self):
+        ok, ttl = _is_cacheable_response({"cache-control": "public, max-age=600"})
+        assert ok is True
+        assert ttl == 600
+
+    def test_no_cache_control_header_is_not_cacheable(self):
+        ok, ttl = _is_cacheable_response({"content-type": "application/javascript"})
+        assert ok is False
+        assert ttl == 0
+
+    def test_no_store_refused(self):
+        ok, _ = _is_cacheable_response({"cache-control": "no-store, max-age=600"})
+        assert ok is False
+
+    def test_no_cache_refused(self):
+        ok, _ = _is_cacheable_response({"cache-control": "no-cache, max-age=600"})
+        assert ok is False
+
+    def test_private_refused(self):
+        # Private = user-specific; sharing across Jobs (= sharing across
+        # IPs) is exactly what we promise NOT to do.
+        ok, _ = _is_cacheable_response({"cache-control": "private, max-age=600"})
+        assert ok is False
+
+    def test_must_revalidate_refused(self):
+        ok, _ = _is_cacheable_response({
+            "cache-control": "max-age=600, must-revalidate",
+        })
+        assert ok is False
+
+    def test_set_cookie_refused(self):
+        # Set-Cookie marks the response as personalized — even with
+        # max-age, we cannot share it.
+        ok, _ = _is_cacheable_response({
+            "cache-control": "max-age=600",
+            "set-cookie": "session=abc",
+        })
+        assert ok is False
+
+    def test_vary_accept_encoding_only_is_ok(self):
+        ok, ttl = _is_cacheable_response({
+            "cache-control": "max-age=600",
+            "vary": "Accept-Encoding",
+        })
+        assert ok is True
+        assert ttl == 600
+
+    def test_vary_other_header_refused(self):
+        # We don't key on cookies / user-agent — refuse responses that
+        # demand we do.
+        ok, _ = _is_cacheable_response({
+            "cache-control": "max-age=600",
+            "vary": "Cookie",
+        })
+        assert ok is False
+
+    def test_vary_with_extra_dimension_refused(self):
+        ok, _ = _is_cacheable_response({
+            "cache-control": "max-age=600",
+            "vary": "Accept-Encoding, User-Agent",
+        })
+        assert ok is False
+
+    def test_header_lookup_is_case_insensitive(self):
+        ok, ttl = _is_cacheable_response({
+            "Cache-Control": "max-age=600",
+            "Set-Cookie": "session=abc",
+        })
+        assert ok is False
+
+
+# ────────────────────────────────────────────────
+# DiskCache — round-trip, TTL, soft fail
+# ────────────────────────────────────────────────
+
+def _build_cache(tmp_path: Path, **overrides) -> DiskCache:
+    args = dict(
+        root=tmp_path / "cache",
+        domains=["pstatic.net"],
+        min_ttl_seconds=60,
+        max_ttl_seconds=3600,
+        max_body_bytes=1024 * 1024,
+    )
+    args.update(overrides)
+    return DiskCache(**args)
+
+
+class TestDiskCacheRoundTrip:
+    def test_put_then_get_returns_body(self, tmp_path: Path):
+        cache = _build_cache(tmp_path)
+        url = "https://ssl.pstatic.net/x.js"
+        body = b"console.log('hi');"
+        assert cache.put(url, body, ttl_seconds=600, content_type="application/javascript") is True
+        hit = cache.get(url)
+        assert hit is not None
+        got_body, content_type = hit
+        assert got_body == body
+        assert content_type == "application/javascript"
+
+    def test_get_on_cold_cache_returns_none(self, tmp_path: Path):
+        cache = _build_cache(tmp_path)
+        assert cache.get("https://ssl.pstatic.net/missing.js") is None
+
+    def test_has_fresh_matches_get(self, tmp_path: Path):
+        cache = _build_cache(tmp_path)
+        url = "https://ssl.pstatic.net/x.js"
+        assert cache.has_fresh(url) is False
+        cache.put(url, b"x", ttl_seconds=600, content_type="application/javascript")
+        assert cache.has_fresh(url) is True
+
+    def test_distinct_urls_dont_collide(self, tmp_path: Path):
+        cache = _build_cache(tmp_path)
+        cache.put("https://x/a.js", b"AAA", 600, "application/javascript")
+        cache.put("https://x/b.js", b"BBB", 600, "application/javascript")
+        assert cache.get("https://x/a.js")[0] == b"AAA"
+        assert cache.get("https://x/b.js")[0] == b"BBB"
+
+    def test_put_idempotent_for_same_url(self, tmp_path: Path):
+        # Two writers racing on the same URL is the documented "fine"
+        # path — content is identical, last writer wins.
+        cache = _build_cache(tmp_path)
+        url = "https://x/a.js"
+        cache.put(url, b"v1", 600, "application/javascript")
+        cache.put(url, b"v1", 600, "application/javascript")
+        assert cache.get(url)[0] == b"v1"
+
+
+class TestDiskCacheTtl:
+    def test_below_min_ttl_is_skipped(self, tmp_path: Path):
+        # Server says 1s, our floor is 60s — refuse to store rather than
+        # silently extend a deliberately-short TTL.
+        cache = _build_cache(tmp_path, min_ttl_seconds=60)
+        stored = cache.put(
+            "https://x/a.js", b"x",
+            ttl_seconds=1, content_type="application/javascript",
+        )
+        assert stored is False
+        assert cache.get("https://x/a.js") is None
+
+    def test_max_ttl_caps_long_max_age(self, tmp_path: Path, monkeypatch):
+        # Server says max-age=year; we cap at max_ttl. After max_ttl+1
+        # seconds (simulated via monkeypatched time.time), the entry must
+        # be gone — proving the cap wrote a near-term expiry, not the
+        # year the server requested.
+        import ranker.resources as res_mod
+
+        cache = _build_cache(tmp_path, min_ttl_seconds=1, max_ttl_seconds=10)
+        cache.put("https://x/a.js", b"x", ttl_seconds=31_536_000, content_type="application/javascript")
+
+        real_time = res_mod.time.time
+        monkeypatch.setattr(
+            res_mod.time, "time", lambda: real_time() + 11,
+        )
+        assert cache.get("https://x/a.js") is None
+        assert cache.has_fresh("https://x/a.js") is False
+
+    def test_expired_entry_returns_none(self, tmp_path: Path, monkeypatch):
+        import ranker.resources as res_mod
+
+        cache = _build_cache(tmp_path, min_ttl_seconds=1, max_ttl_seconds=10)
+        cache.put("https://x/a.js", b"x", ttl_seconds=5, content_type="application/javascript")
+        real_time = res_mod.time.time
+        monkeypatch.setattr(res_mod.time, "time", lambda: real_time() + 6)
+        assert cache.get("https://x/a.js") is None
+
+
+class TestDiskCacheSoftFail:
+    def test_corrupt_meta_returns_none_not_raises(self, tmp_path: Path):
+        cache = _build_cache(tmp_path)
+        url = "https://x/a.js"
+        cache.put(url, b"x", 600, "application/javascript")
+        _, meta_path = cache._paths(url)
+        meta_path.write_text("not-json{{{")
+        # Must NOT raise — caching is best-effort.
+        assert cache.get(url) is None
+        assert cache.has_fresh(url) is False
+
+    def test_missing_body_returns_none(self, tmp_path: Path):
+        cache = _build_cache(tmp_path)
+        url = "https://x/a.js"
+        cache.put(url, b"x", 600, "application/javascript")
+        body_path, _ = cache._paths(url)
+        body_path.unlink()
+        assert cache.get(url) is None
+
+    def test_oversize_body_skipped(self, tmp_path: Path):
+        cache = _build_cache(tmp_path, max_body_bytes=10)
+        stored = cache.put(
+            "https://x/big.js", b"x" * 100, 600, "application/javascript",
+        )
+        assert stored is False
+        assert cache.get("https://x/big.js") is None
+
+
+class TestCacheCounterSummary:
+    def test_empty_returns_blank_string(self):
+        assert CacheCounter().summary() == ""
+
+    def test_summary_includes_hits_misses_and_bytes(self):
+        c = CacheCounter(hits=8, misses=2, stored=2, bytes_saved=4096)
+        s = c.summary()
+        assert "8" in s   # hits
+        assert "10" in s  # total looked up
+        assert "2" in s   # stored
+        assert "4" in s   # KB

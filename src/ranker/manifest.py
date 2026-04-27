@@ -359,6 +359,74 @@ class Proxy(BaseModel):
         return int(parse_duration(self.session_ttl).total_seconds() // 60)
 
 
+class Cache(BaseModel):
+    """Cross-Job disk cache for static script responses.
+
+    When enabled, ``script`` requests to whitelisted domains are served
+    from a shared on-disk cache instead of going through the proxy. Cache
+    semantics follow the response's own ``Cache-Control: max-age``;
+    personalized responses (``Set-Cookie``, restrictive ``Vary``) are
+    refused so cached entries are interchangeable across Jobs and IPs.
+
+    All running Jobs share ``dir``. Concurrent writes for the same URL
+    are safe: contents are byte-identical so last-writer-wins is a no-op,
+    and atomic renames prevent partial reads.
+
+    The cache is best-effort: any read/write error is swallowed and the
+    request falls back to the network — caching can never break a run.
+    """
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    dir: Path = Path(".ranker-cache")
+    # Hostname-substring whitelist. Defaults to Naver's static asset CDN,
+    # where URLs are versioned and contents are immutable for the URL's
+    # lifetime — exactly the shape that caches well. ``naver.com`` is
+    # deliberately NOT a default; HTML/XHR responses from there carry
+    # session cookies and dynamic data we never want to cache.
+    domains: list[str] = Field(default_factory=lambda: ["pstatic.net"])
+    # Floor on the response's max-age. Below this, the bookkeeping cost
+    # outweighs the savings; also guards against caching responses with
+    # accidentally-tiny TTLs.
+    min_ttl: str = "1m"
+    # Ceiling on cached entry lifetime. Even if a server says
+    # ``max-age=31536000`` we don't trust ourselves to hold a byte-exact
+    # file longer than this — forces a periodic refetch so genuine
+    # upstream changes propagate within max_ttl.
+    max_ttl: str = "24h"
+    # Body size cap. Above this, skip caching to avoid pathological
+    # disk usage from a misclassified response.
+    max_body_kb: Annotated[int, Field(ge=1)] = 4096
+
+    @field_validator("min_ttl", "max_ttl")
+    @classmethod
+    def _check_ttl(cls, v: str) -> str:
+        parse_duration(v)
+        return v
+
+    @field_validator("domains")
+    @classmethod
+    def _check_domains(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("cache.domains must list at least one host substring")
+        return v
+
+    @model_validator(mode="after")
+    def _check_ttl_order(self) -> Cache:
+        if parse_duration(self.min_ttl) > parse_duration(self.max_ttl):
+            raise ValueError(
+                f"cache.min_ttl ({self.min_ttl}) must be <= max_ttl ({self.max_ttl})"
+            )
+        return self
+
+    @property
+    def min_ttl_seconds(self) -> int:
+        return int(parse_duration(self.min_ttl).total_seconds())
+
+    @property
+    def max_ttl_seconds(self) -> int:
+        return int(parse_duration(self.max_ttl).total_seconds())
+
+
 class Resources(BaseModel):
     """Network-level traffic control.
 
@@ -374,10 +442,14 @@ class Resources(BaseModel):
     ``block_third_party_trackers`` aborts requests to a curated list of
     well-known ad/analytics hosts. First-party Naver telemetry is always
     allowed, so the session still looks like a normal user (with adblock).
+
+    ``cache`` enables a cross-Job on-disk cache for static script bodies
+    (Naver CDN by default). See :class:`Cache` for the safety contract.
     """
     model_config = ConfigDict(extra="forbid")
     block: list[ResourceType] = Field(default_factory=list)
     block_third_party_trackers: bool = False
+    cache: Cache | None = None
 
 
 class JobOverride(BaseModel):

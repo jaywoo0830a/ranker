@@ -38,9 +38,21 @@ proxy:
 # 프록시 트래픽 절감 — 페이지 단계에서 이미지/폰트/미디어/광고 트래커 차단.
 # rank 파싱과 dwell 동작에는 영향 없음 (HTML anchor + DOM 기반).
 # 차단 통계는 각 Job 종료 로그에 'blocked X of Y requests' 로 표시됨.
+#
+# cache: 정적 script 응답을 모든 Job 이 공유하는 디스크 캐시. 서버가 직접
+# 명시한 Cache-Control: max-age 만 따르고, Set-Cookie / restrictive Vary
+# 가 있으면 거부 — 개인화 응답은 절대 캐시하지 않음. 검색 결과 자체
+# (HTML/XHR) 는 화이트리스트가 'pstatic.net' 으로 좁혀 있어 캐시 대상
+# 자체가 아님. 통계는 'cache: H/T hits, S stored, K KB saved' 로 표시됨.
 resources:
   block: [image, font, media]
   block_third_party_trackers: true
+  cache:
+    enabled: true
+    dir: .ranker-cache
+    domains: [pstatic.net]
+    min_ttl: 1m
+    max_ttl: 24h
 
 # 각 Job이 자체 sticky session → 자체 IP. 4 Job 동시 = 4 IP 동시.
 jobs:

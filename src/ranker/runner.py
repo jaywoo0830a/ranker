@@ -347,6 +347,8 @@ async def _run_one_job(
         _log(f"persisted {len(results)} target(s) to {manifest.output.path}")
         if (block_summary := pool.block_summary()):
             _log(block_summary)
+        if (cache_summary := pool.cache_summary()):
+            _log(cache_summary)
     finally:
         with suppress(Exception):
             await pool.close()
