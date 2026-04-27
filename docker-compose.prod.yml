@@ -29,7 +29,7 @@ services:
     ports:
       # 호스트 nginx가 80/443 점유 중 — 루프백에만 바인딩하고
       # 호스트 vhost(ranker.rarara1020a.site)에서 proxy_pass.
-      - "127.0.0.1:8080:80"
+      - "${WEBAPP_PROD_BIND:-127.0.0.1}:${WEBAPP_PROD_PORT:-8080}:80"
     volumes: []   # no source mount in prod
     environment: []
     # nginx ENTRYPOINT runs by default; no command override.

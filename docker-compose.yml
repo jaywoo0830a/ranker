@@ -12,7 +12,7 @@ services:
       dockerfile: dockerfiles/api.Dockerfile
     image: ranker-api:dev
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     env_file:
       # ProxyEmpire credentials live here (gitignored). Optional — manifests
       # without a `proxy:` block don't need them.
@@ -38,7 +38,7 @@ services:
       target: dev
     image: ranker-webapp:dev
     ports:
-      - "5173:5173"
+      - "${WEBAPP_PORT:-5173}:5173"
     environment:
       # Vite proxies /api/* to this URL — service hostname inside the
       # compose network.
