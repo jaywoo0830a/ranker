@@ -4,7 +4,8 @@ version: 1
 # 실행:
 #   ranker examples/dev.yaml
 # 결과는 examples/ranks.yaml 에 기록.
-# 운영 매니페스트(병렬 4 Job + 프록시 + post_visit)는 examples/prod.yaml 참고.
+# 운영 매니페스트(병렬 4 Job + 프록시 + post_visit + 캐시)는
+# examples/prod.yaml 참고.
 
 schedule:
   count: 1
@@ -21,6 +22,13 @@ targets:
 output:
   path: examples/ranks.yaml
   mode: overwrite
+
+# 페이지 렌더 가속용 — 프록시 트래픽이 아니라 로컬 페이지 로드 시간을
+# 줄이는 목적. 랭킹 파싱은 HTML anchor 기반이라 영향 없음.
+# cache 는 dev 에선 의도적으로 끔 (fresh state 가 디버깅에 유리).
+resources:
+  block: [image, font, media, stylesheet]
+  block_third_party_trackers: true
 
 behavior:
   dwell_ms:           { min: 500,  max: 1500 }

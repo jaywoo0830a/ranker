@@ -9,7 +9,10 @@ version: 1
 #   set -a; source .env; set +a
 #   ranker examples/prod.yaml
 #
-# 결과는 examples/ranks.yaml 에 누적 (append). 각 run dict는 job/mode 태그.
+# 결과:
+#   - examples/ranks.yaml        (랭크 결과, append)
+#   - examples/cache_stats.yaml  (캐시 절감 통계, run 종료 시 자동 생성)
+# 각 run dict 는 job/mode 태그 — 측정 출처 식별용.
 
 schedule:
   count: 24
@@ -35,24 +38,27 @@ proxy:
   country: kr
   session_ttl: 30m
 
-# 프록시 트래픽 절감 — 페이지 단계에서 이미지/폰트/미디어/광고 트래커 차단.
-# rank 파싱과 dwell 동작에는 영향 없음 (HTML anchor + DOM 기반).
-# 차단 통계는 각 Job 종료 로그에 'blocked X of Y requests' 로 표시됨.
-#
-# cache: 정적 script 응답을 모든 Job 이 공유하는 디스크 캐시. 서버가 직접
-# 명시한 Cache-Control: max-age 만 따르고, Set-Cookie / restrictive Vary
-# 가 있으면 거부 — 개인화 응답은 절대 캐시하지 않음. 검색 결과 자체
-# (HTML/XHR) 는 화이트리스트가 'pstatic.net' 으로 좁혀 있어 캐시 대상
-# 자체가 아님. 통계는 'cache: H/T hits, S stored, K KB saved' 로 표시됨.
+# 트래픽 절감 — 3 레이어:
+#   • block: 정적 자산 (image/font/media/stylesheet) 페이지 단계 차단.
+#     랭킹은 HTML anchor 기반, dwell 은 시간 기반 → 영향 없음.
+#   • block_third_party_trackers: 광고/분석 트래커 차단. naver 1st-party
+#     는 항상 통과 (정상 사용자 + adblock 수준).
+#   • cache: pstatic.net script 응답 디스크 캐시. 4 Job 이 디렉토리
+#     공유 → 한 Job 이 받으면 나머지 3 Job 은 디스크 hit (네트워크 도달 0).
+#     run 사이에도 유지 — 24h max_ttl 안에서는 Cache-Control 만료 전엔
+#     재요청 안 함. anti-cache 헤더 (no-store/Set-Cookie/제한적 Vary)
+#     는 fallback 모드에서도 무조건 거부 — 개인화 응답 절대 캐시 안 함.
+#   • cache.dir 미명시 → 기본 .ranker-cache (CWD 상대). 웹 업로드 시엔
+#     서버가 .shared-cache 로 자동 덮어씀.
+# 통계는 run 종료 로그 + cache_stats.yaml 파일에 기록.
 resources:
-  block: [image, font, media]
+  block: [image, font, media, stylesheet]
   block_third_party_trackers: true
   cache:
     enabled: true
-    dir: .ranker-cache
     domains: [pstatic.net]
-    min_ttl: 1m
-    max_ttl: 24h
+    max_ttl: 7d         # pstatic versioned URL 은 immutable, 7일 캡 안전
+    fallback_ttl: 24h   # Cache-Control 없는 응답도 24h 캐시
 
 # 각 Job이 자체 sticky session → 자체 IP. 4 Job 동시 = 4 IP 동시.
 jobs:
