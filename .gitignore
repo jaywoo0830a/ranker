@@ -28,3 +28,11 @@ debug/
 !.env.example
 
 playground
+
+# Webapp build artifacts
+webapp/node_modules/
+webapp/dist/
+webapp/.vite/
+
+# API server runtime data — uploaded jobs, results, logs
+jobs/

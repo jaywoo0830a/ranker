@@ -1,0 +1,32 @@
+# Prod overrides — apply on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Differences from dev:
+#  - Webapp built once and served via nginx (no source mount, no HMR).
+#  - Single public port (80) — nginx reverse-proxies /api/* to the api service.
+#  - API: no --reload, no source mount.
+
+services:
+  api:
+    image: ranker-api:prod
+    build:
+      context: .
+      dockerfile: dockerfiles/api.Dockerfile
+    ports: []   # api not exposed publicly; nginx reaches it on the compose network
+    volumes:
+      - jobs_data:/data/jobs   # source mount removed
+    command: >
+      uvicorn ranker_service.api:app
+      --host 0.0.0.0 --port 8000
+
+  webapp:
+    image: ranker-webapp:prod
+    build:
+      context: .
+      dockerfile: dockerfiles/webapp.Dockerfile
+      target: prod
+    ports:
+      - "80:80"
+    volumes: []   # no source mount in prod
+    environment: []
+    # nginx ENTRYPOINT runs by default; no command override.

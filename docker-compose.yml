@@ -1,0 +1,58 @@
+# Dev compose — `docker compose up` for hot-reload everywhere.
+#   API: uvicorn --reload, source mounted at /app/src
+#   Webapp: vite dev server, source mounted at /app
+# Job artifacts live in a named volume so they survive container restarts.
+#
+# For prod, additionally pass `-f docker-compose.yml -f docker-compose.prod.yml`.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: dockerfiles/api.Dockerfile
+    image: ranker-api:dev
+    ports:
+      - "8000:8000"
+    env_file:
+      # ProxyEmpire credentials live here (gitignored). Optional — manifests
+      # without a `proxy:` block don't need them.
+      - .env
+    environment:
+      - RANKER_SERVICE_JOBS_DIR=/data/jobs
+      - RANKER_SERVICE_MAX_CONCURRENT_JOBS=4
+      - RANKER_BIN=/usr/local/bin/ranker
+    volumes:
+      # Source mount — uvicorn --reload picks up edits.
+      - ./src:/app/src
+      # Job artifacts persist across `docker compose down`.
+      - jobs_data:/data/jobs
+    command: >
+      uvicorn ranker_service.api:app
+      --host 0.0.0.0 --port 8000
+      --reload --reload-dir /app/src
+
+  webapp:
+    build:
+      context: .
+      dockerfile: dockerfiles/webapp.Dockerfile
+      target: dev
+    image: ranker-webapp:dev
+    ports:
+      - "5173:5173"
+    environment:
+      # Vite proxies /api/* to this URL — service hostname inside the
+      # compose network.
+      - VITE_API_TARGET=http://api:8000
+    volumes:
+      # Source mount — Vite HMR picks up edits.
+      - ./webapp/src:/app/src
+      - ./webapp/index.html:/app/index.html
+      - ./webapp/vite.config.js:/app/vite.config.js
+      # node_modules stays inside the container (anonymous volume) so the
+      # host's missing node_modules doesn't shadow the container's.
+      - /app/node_modules
+    depends_on:
+      - api
+
+volumes:
+  jobs_data:

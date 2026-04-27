@@ -1,0 +1,422 @@
+openapi: 3.2.0
+
+info:
+  title: Ranker Service API
+  version: 0.1.0
+  summary: Submit Naver blog rank-tracking jobs and download results.
+  description: |
+    Each `Job` corresponds to one ranker CLI invocation, executed as a
+    subprocess on the server. The client uploads a manifest YAML and a
+    posts (report) YAML; the server queues the job, runs it under a
+    concurrency cap, and exposes status / logs / result file as the run
+    progresses.
+
+    No authentication — local / private-network use only.
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8000
+    description: Local dev server
+
+tags:
+  - name: Jobs
+    description: Lifecycle of a submitted ranker run.
+
+paths:
+  /api/jobs:
+    get:
+      tags: [Jobs]
+      summary: List jobs (newest first)
+      operationId: listJobs
+      parameters:
+        - in: query
+          name: status
+          required: false
+          description: Filter by status
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+        - in: query
+          name: limit
+          required: false
+          description: Max jobs returned (default 50)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: List + server-wide concurrency snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobListResponse'
+
+    post:
+      tags: [Jobs]
+      summary: Create a new job (multipart upload)
+      description: |
+        Uploads a manifest YAML and a posts YAML. The server validates
+        both with the same Pydantic models the CLI uses; validation errors
+        return 400 with field-level details.
+
+        The job enters the queue. If a concurrency slot is free it starts
+        immediately (status=`running`); otherwise it waits (status=`pending`,
+        `queue_position` populated).
+
+        The server overrides the manifest's `output.path` to a private
+        per-job location, so multiple uploads with the same path do not
+        collide.
+      operationId: createJob
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/JobCreateRequest'
+            encoding:
+              manifest:
+                contentType: application/yaml
+              posts:
+                contentType: application/yaml
+      responses:
+        '201':
+          description: Job accepted (queued or running)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /api/jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+
+    get:
+      tags: [Jobs]
+      summary: Get a single job's full state
+      operationId: getJob
+      responses:
+        '200':
+          description: Job detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [Jobs]
+      summary: Cancel running job or delete a finished job
+      description: |
+        - Status `running` → SIGTERM the subprocess; status becomes
+          `cancelled`. Partial results stay accessible via
+          `/api/jobs/{id}/result`.
+        - Status `pending` → remove from queue.
+        - Status `completed`/`failed`/`cancelled` → delete the job
+          directory (manifest, posts, result, logs all removed).
+      operationId: deleteJob
+      responses:
+        '204':
+          description: Cancelled or deleted (no body)
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/jobs/{job_id}/result:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+
+    get:
+      tags: [Jobs]
+      summary: Download result YAML
+      description: |
+        Returns the manifest's output YAML. The runner persists incrementally
+        after every scheduled run, so partial results are available while
+        status is `running`.
+      operationId: getJobResult
+      responses:
+        '200':
+          description: Result YAML (full or partial)
+          content:
+            application/yaml:
+              schema:
+                type: string
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: e.g. `attachment; filename="ranks_<job_id>.yaml"`
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Result not yet available — job is `pending` (no run has
+            produced output) or `failed` before any persistence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/jobs/{job_id}/logs:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+
+    get:
+      tags: [Jobs]
+      summary: Get the runner's stderr log
+      operationId: getJobLogs
+      parameters:
+        - in: query
+          name: tail
+          required: false
+          description: Return only the last N lines
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 10000
+      responses:
+        '200':
+          description: Plain-text log (each line is a `[ranker] ...` entry)
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+
+  parameters:
+    JobId:
+      in: path
+      name: job_id
+      required: true
+      schema:
+        type: string
+        pattern: '^job_[a-zA-Z0-9]{6,}$'
+      description: Server-assigned identifier (e.g. `job_a1b2c3d4`)
+
+  schemas:
+
+    JobStatus:
+      type: string
+      enum: [pending, running, completed, failed, cancelled]
+      description: |
+        - `pending`: queued, waiting for a concurrency slot
+        - `running`: subprocess is executing
+        - `completed`: subprocess exited 0 (all scheduled runs finished)
+        - `failed`: subprocess exited non-zero or unhandled error before finish
+        - `cancelled`: client issued DELETE while running
+
+    JobMode:
+      type: string
+      enum: [desktop, mobile]
+      description: Mirrors the manifest's `mode` field.
+
+    NullableDateTime:
+      description: ISO 8601 date-time, or null when not yet known.
+      oneOf:
+        - type: string
+          format: date-time
+        - type: "null"
+
+    NullableInteger:
+      oneOf:
+        - type: integer
+        - type: "null"
+
+    NullableString:
+      oneOf:
+        - type: string
+        - type: "null"
+
+    Progress:
+      type: object
+      additionalProperties: false
+      required: [completed_runs, total_runs]
+      properties:
+        completed_runs:
+          type: integer
+          minimum: 0
+          description: Number of fully-finished scheduled runs so far.
+        total_runs:
+          type: integer
+          minimum: 1
+          description: Mirrors `manifest.schedule.count`.
+        next_run_at:
+          $ref: '#/components/schemas/NullableDateTime'
+
+    JobConfig:
+      type: object
+      additionalProperties: false
+      required: [name, mode]
+      properties:
+        name:
+          type: string
+        mode:
+          $ref: '#/components/schemas/JobMode'
+
+    Job:
+      type: object
+      additionalProperties: false
+      required: [id, name, status, created_at, progress, jobs_config, targets_count]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          description: Human-readable label supplied at create time.
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          $ref: '#/components/schemas/NullableDateTime'
+        completed_at:
+          $ref: '#/components/schemas/NullableDateTime'
+        progress:
+          $ref: '#/components/schemas/Progress'
+        jobs_config:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobConfig'
+          description: Resolved Job list (manifest's `jobs` block expanded).
+        targets_count:
+          type: integer
+          minimum: 0
+        queue_position:
+          $ref: '#/components/schemas/NullableInteger'
+          description: |
+            null when not in queue (running/finished). 0-indexed position
+            otherwise — `0` is next-to-start.
+        error:
+          $ref: '#/components/schemas/NullableString'
+          description: One-line summary when status=`failed`. Full traceback in `/logs`.
+
+    JobSummary:
+      type: object
+      additionalProperties: false
+      required: [id, name, status, created_at, progress]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        created_at:
+          type: string
+          format: date-time
+        progress:
+          $ref: '#/components/schemas/Progress'
+        queue_position:
+          $ref: '#/components/schemas/NullableInteger'
+
+    ConcurrencyInfo:
+      type: object
+      additionalProperties: false
+      required: [running, queued, max]
+      properties:
+        running:
+          type: integer
+          minimum: 0
+        queued:
+          type: integer
+          minimum: 0
+        max:
+          type: integer
+          minimum: 1
+          description: From server env `RANKER_SERVICE_MAX_CONCURRENT_JOBS`.
+
+    JobListResponse:
+      type: object
+      additionalProperties: false
+      required: [jobs, concurrency]
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobSummary'
+        concurrency:
+          $ref: '#/components/schemas/ConcurrencyInfo'
+
+    JobCreateRequest:
+      type: object
+      required: [manifest, posts]
+      properties:
+        manifest:
+          type: string
+          format: binary
+          description: YAML manifest file.
+        posts:
+          type: string
+          format: binary
+          description: YAML target list (the "보고서").
+        name:
+          type: string
+          maxLength: 100
+          description: Optional label; defaults to `job_<created_at>`.
+
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Machine-readable code, e.g. `validation_error`.
+        message:
+          type: string
+          description: Human-readable single-line explanation.
+        details:
+          type: object
+          additionalProperties: true
+          description: |
+            Field-level information for validation errors. Mirrors
+            Pydantic's error structure when applicable.
+
+  responses:
+
+    ValidationError:
+      description: Uploaded manifest or posts failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            manifestSchema:
+              summary: Manifest schema error
+              value:
+                error: validation_error
+                message: "manifest.schedule.start must include timezone offset"
+                details:
+                  field: schedule.start
+                  got: "2026-04-27T04:00:00"
+            envMissing:
+              summary: Proxy block requires env vars
+              value:
+                error: env_missing
+                message: "manifest has 'proxy:' but server missing PROXYEMPIRE_USERNAME, PROXYEMPIRE_PASSWORD"
+
+    PayloadTooLarge:
+      description: One of the uploaded files exceeded the server limit.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    NotFound:
+      description: No job with the given id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: not_found
+            message: "no job with id job_a1b2c3d4"
