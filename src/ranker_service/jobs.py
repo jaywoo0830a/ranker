@@ -93,8 +93,13 @@ class JobManager:
                 self.jobs_root, job_id,
                 status="completed", completed_at=_now_iso(), error=None,
             )
-        elif rc < 0:
-            # Killed by signal (SIGTERM = -15, SIGKILL = -9).
+        elif rc < 0 or rc == 130:
+            # ``rc < 0`` = killed by uncaught signal (SIGKILL = -9).
+            # ``rc == 130`` = SIGINT/SIGTERM caught by the CLI, which
+            # ran graceful cleanup (closing Playwright) and exited via
+            # the conventional ``128 + SIGINT`` code. Both cases are
+            # "we asked it to stop" — surface as cancelled, not failed,
+            # so the UI doesn't paint a red error on an intentional stop.
             storage.update_state(
                 self.jobs_root, job_id,
                 status="cancelled", completed_at=_now_iso(), error=None,
@@ -134,6 +139,27 @@ class JobManager:
         storage.update_state(
             self.jobs_root, job_id,
             status="cancelled", completed_at=_now_iso(),
+        )
+
+    async def cancel_all(self) -> None:
+        """Cancel every running and pending job in parallel.
+
+        Used at server shutdown so each subprocess catches its SIGTERM,
+        runs the runner's ``finally`` chain (closing Playwright +
+        Chromium), and exits cleanly within 5s — instead of getting
+        SIGKILL'd by the OS when uvicorn's parent dies and leaving
+        orphaned headless Chromium behind.
+
+        Per-cancel timeout is the same 5s as the single-job ``cancel``;
+        running them via ``gather`` keeps total shutdown time bounded
+        regardless of how many jobs were active.
+        """
+        ids = list(self._processes.keys()) + list(self._tasks.keys())
+        if not ids:
+            return
+        await asyncio.gather(
+            *(self.cancel(jid) for jid in ids),
+            return_exceptions=True,
         )
 
     def is_running(self, job_id: str) -> bool:

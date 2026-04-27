@@ -103,7 +103,16 @@ async def lifespan(app: FastAPI):
             flush=True,
         )
     app.state.manager = JobManager(jobs_root, max_concurrent)
-    yield
+    try:
+        yield
+    finally:
+        # Graceful shutdown — SIGTERM every active subprocess so the
+        # runner's signal handler can close Playwright + Chromium
+        # before exiting. Without this, uvicorn dying leaves the
+        # node driver + headless Chromium running as orphans on the
+        # host (tested case: parent-death without cleanup left a
+        # full Chromium tree alive, holding RAM and proxy sockets).
+        await app.state.manager.cancel_all()
 
 
 app = FastAPI(
