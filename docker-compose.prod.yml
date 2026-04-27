@@ -3,7 +3,8 @@
 #
 # Differences from dev:
 #  - Webapp built once and served via nginx (no source mount, no HMR).
-#  - Single public port (80) — nginx reverse-proxies /api/* to the api service.
+#  - Webapp 컨테이너 nginx는 127.0.0.1:8080에만 바인딩 — 호스트 nginx가
+#    바깥 80/443에서 TLS 종료 후 여기로 proxy_pass.
 #  - API: no --reload, no source mount.
 
 services:
@@ -26,7 +27,9 @@ services:
       dockerfile: dockerfiles/webapp.Dockerfile
       target: prod
     ports:
-      - "80:80"
+      # 호스트 nginx가 80/443 점유 중 — 루프백에만 바인딩하고
+      # 호스트 vhost(ranker.rarara1020a.site)에서 proxy_pass.
+      - "127.0.0.1:8080:80"
     volumes: []   # no source mount in prod
     environment: []
     # nginx ENTRYPOINT runs by default; no command override.
