@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getJob, getJobLogs } from '../api.js'
+import { getJob, jobLogsStreamUrl } from '../api.js'
 
 const POLL_MS = 5000
 const LOG_TAIL = 200
@@ -9,20 +9,17 @@ export default function JobDetail({ jobId, onClose }) {
   const [logs, setLogs] = useState('')
   const [error, setError] = useState(null)
 
+  // Job state is small and infrequent — keep polling rather than
+  // multiplexing it onto the log WS. Failures here are user-visible
+  // (the dl block disappears) so we surface them as ``error``.
   useEffect(() => {
     let cancelled = false
 
     async function load() {
       try {
-        // Logs may legitimately 404 right after job creation (before the
-        // subprocess writes anything) — swallow and keep polling.
-        const [j, l] = await Promise.all([
-          getJob(jobId),
-          getJobLogs(jobId, { tail: LOG_TAIL }).catch(() => ''),
-        ])
+        const j = await getJob(jobId)
         if (!cancelled) {
           setJob(j)
-          setLogs(l)
           setError(null)
         }
       } catch (e) {
@@ -35,6 +32,23 @@ export default function JobDetail({ jobId, onClose }) {
     return () => {
       cancelled = true
       clearInterval(id)
+    }
+  }, [jobId])
+
+  // Live logs via WebSocket — initial tail then streamed deltas. The
+  // server closes the WS once the job reaches a terminal state, so we
+  // don't reconnect on close: the next chunk is whatever final bytes
+  // the server flushed, and there's nothing more to stream.
+  useEffect(() => {
+    setLogs('')
+    const ws = new WebSocket(jobLogsStreamUrl(jobId))
+    ws.onmessage = (event) => {
+      setLogs((prev) => prev + event.data)
+    }
+    return () => {
+      // Triggered on unmount or jobId change. close() is a no-op if the
+      // server already closed.
+      ws.close()
     }
   }, [jobId])
 

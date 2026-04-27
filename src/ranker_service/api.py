@@ -9,13 +9,23 @@ startup and mark orphans as ``failed``.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
@@ -267,3 +277,126 @@ async def get_job_logs(
     if tail:
         text = "\n".join(text.splitlines()[-tail:])
     return text
+
+
+# Terminal states a Job may finish in. Used by the log streamer to
+# decide when to drain the file one last time and close the WebSocket.
+_TERMINAL_STATES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+
+# How often the streamer re-stats the log file looking for new bytes.
+# 300ms is well under human latency tolerance ("real-time enough") and
+# costs almost nothing — one stat() per active connection per tick.
+_LOG_POLL_S = 0.3
+
+# Initial backlog sent on connect — matches the HTTP endpoint's default
+# tail size so the WS view picks up where the polling view used to.
+_LOG_INITIAL_TAIL = 200
+
+
+@app.websocket("/api/jobs/{job_id}/logs/stream")
+async def stream_job_logs(websocket: WebSocket, job_id: str):
+    """Stream a job's log as it is written.
+
+    On connect: send the last ``_LOG_INITIAL_TAIL`` lines (matches the
+    HTTP endpoint's default ``?tail=200``). Then poll the log file every
+    ``_LOG_POLL_S`` seconds and forward any newly-appended bytes. When
+    the Job reaches a terminal state, drain any final bytes and close
+    cleanly with code 1000.
+
+    Failure modes:
+    - Job not found → close with 4404 before accept (the WS handshake
+      still completes; the close frame carries the reason).
+    - Client disconnects mid-stream → caught and returned silently.
+    - Unexpected errors → close with 1011 (server error). The server
+      keeps running; only this connection dies.
+    """
+    await websocket.accept()
+    try:
+        state = storage.read_state(_jobs_root(), job_id)
+        if state is None:
+            await websocket.close(code=4404, reason="job not found")
+            return
+
+        log_path = storage.job_dir(_jobs_root(), job_id) / "log.txt"
+
+        # Wait for the subprocess to actually create the log file. A
+        # freshly-submitted job has a state.json but no log yet — the
+        # CLI subprocess writes its first line a moment later.
+        while not log_path.exists():
+            state = storage.read_state(_jobs_root(), job_id)
+            if state is None or state["status"] in _TERMINAL_STATES:
+                # Job finished without producing logs (rare — usually
+                # means the subprocess died before writing anything).
+                await websocket.close()
+                return
+            await asyncio.sleep(_LOG_POLL_S)
+
+        # Initial tail. Reading the whole file once is fine — it's
+        # bounded by however long the job has been running, and we
+        # only do this on connect.
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        initial = (
+            "".join(lines[-_LOG_INITIAL_TAIL:])
+            if len(lines) > _LOG_INITIAL_TAIL
+            else text
+        )
+        if initial:
+            await websocket.send_text(initial)
+        pos = log_path.stat().st_size
+
+        # Tail-follow loop — poll the file size, forward any new bytes,
+        # exit when the Job is done. Reading bytes (not text) and
+        # decoding here means we never split a multi-byte UTF-8
+        # sequence across two sends.
+        while True:
+            try:
+                current_size = log_path.stat().st_size
+            except FileNotFoundError:
+                # Log file was removed (job dir cleanup race) — nothing
+                # more to send.
+                break
+
+            if current_size < pos:
+                # File truncated/replaced. Re-anchor; we don't try to
+                # resend earlier history because the tail we already
+                # sent matches what was there.
+                pos = 0
+            if current_size > pos:
+                with open(log_path, "rb") as f:
+                    f.seek(pos)
+                    new_bytes = f.read()
+                pos = log_path.stat().st_size
+                await websocket.send_text(
+                    new_bytes.decode("utf-8", errors="replace"),
+                )
+
+            state = storage.read_state(_jobs_root(), job_id)
+            if state is None or state["status"] in _TERMINAL_STATES:
+                # Final drain — bytes may have been written between
+                # the size check above and the state check just now.
+                try:
+                    final_size = log_path.stat().st_size
+                except FileNotFoundError:
+                    break
+                if final_size > pos:
+                    with open(log_path, "rb") as f:
+                        f.seek(pos)
+                        await websocket.send_text(
+                            f.read().decode("utf-8", errors="replace"),
+                        )
+                break
+
+            await asyncio.sleep(_LOG_POLL_S)
+
+        await websocket.close()
+    except WebSocketDisconnect:
+        # Client closed the tab / refreshed — perfectly normal.
+        return
+    except Exception:
+        # Unexpected. Best-effort close so the client sees a clean
+        # error frame instead of a hung connection.
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass

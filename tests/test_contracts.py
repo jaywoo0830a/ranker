@@ -52,7 +52,12 @@ from ranker.resources import (
     is_tracker_host,
     make_route_handler,
 )
-from ranker.runner import _due_status, _result_to_run_dict, persist_results
+from ranker.runner import (
+    _due_status,
+    _result_to_run_dict,
+    _slot_delay,
+    persist_results,
+)
 from ranker.search import extract_blog_id, match_rank, normalize_items
 
 
@@ -1535,3 +1540,71 @@ class TestCacheCounterSummary:
         assert "10" in s  # total looked up
         assert "2" in s   # stored
         assert "4" in s   # KB
+
+
+# ────────────────────────────────────────────────
+# Slot-based scheduling — absolute-time anchoring
+# ────────────────────────────────────────────────
+
+class TestSlotDelay:
+    """Run N starts at ``anchor + N * interval`` regardless of how long
+    previous runs took. An overrun displaces only the slots it actually
+    passes; subsequent slots stay on their absolute marks."""
+
+    def _anchor(self) -> datetime:
+        return datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc)
+
+    def test_run_zero_at_anchor_is_immediate(self):
+        anchor = self._anchor()
+        delta = _slot_delay(anchor, timedelta(minutes=30), 0, anchor)
+        assert delta == 0.0
+
+    def test_run_n_target_is_anchor_plus_n_intervals(self):
+        anchor = self._anchor()
+        # Run 2 (0-indexed) → anchor + 60min. Now is 30min in →
+        # 30min remaining until slot.
+        now = anchor + timedelta(minutes=30)
+        delta = _slot_delay(anchor, timedelta(minutes=30), 2, now)
+        assert delta == 1800  # 30min
+
+    def test_late_slot_returns_negative_delay(self):
+        # Previous run overran by 5 minutes — slot 1 was at anchor+30,
+        # but we're already at anchor+35.
+        anchor = self._anchor()
+        now = anchor + timedelta(minutes=35)
+        delta = _slot_delay(anchor, timedelta(minutes=30), 1, now)
+        assert delta == -300  # 5min late
+
+    def test_severe_overrun_does_not_skip_slot(self):
+        # Previous run took 1h15min (interval is 30min). Slot 1 is 45min
+        # late — caller starts immediately, doesn't skip to slot 2.
+        anchor = self._anchor()
+        now = anchor + timedelta(minutes=75)
+        delta = _slot_delay(anchor, timedelta(minutes=30), 1, now)
+        assert delta == -2700  # 45min late
+        # Slot 2 (anchor + 60min) is also late, by 15min
+        delta_2 = _slot_delay(anchor, timedelta(minutes=30), 2, now)
+        assert delta_2 == -900
+
+    def test_self_healing_after_overrun(self):
+        # Run 1 overran (now at anchor+35min, slot 2 target is anchor+60min).
+        # Slot 2 is still 25min in the future — schedule has caught up.
+        anchor = self._anchor()
+        now = anchor + timedelta(minutes=35)
+        delta = _slot_delay(anchor, timedelta(minutes=30), 2, now)
+        assert delta == 1500  # 25min wait
+
+    def test_works_with_mixed_timezones(self):
+        # Anchor in KST, now in UTC — both tz-aware, comparison must work.
+        kst = timezone(timedelta(hours=9))
+        anchor = datetime(2026, 4, 27, 21, 0, tzinfo=kst)  # 21:00 KST = 12:00 UTC
+        now = datetime(2026, 4, 27, 12, 30, tzinfo=timezone.utc)  # 30min after anchor
+        delta = _slot_delay(anchor, timedelta(minutes=30), 1, now)
+        assert delta == 0.0  # exactly on slot 1
+
+    def test_exact_boundary_returns_zero(self):
+        # now == target_slot exactly → delta is 0, caller doesn't sleep.
+        anchor = self._anchor()
+        now = anchor + timedelta(minutes=60)
+        delta = _slot_delay(anchor, timedelta(minutes=30), 2, now)
+        assert delta == 0.0

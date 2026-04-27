@@ -215,6 +215,22 @@ async def _visit_with_retry(
         return await search.visit_post(new_ctx, url, dwell_ms, mouse_events, scroll)
 
 
+def _slot_delay(
+    anchor: datetime, interval: timedelta, run_idx: int, now: datetime,
+) -> float:
+    """Seconds until run ``run_idx`` (0-based) is scheduled to start.
+
+    Returns negative when the slot has already passed — caller starts
+    the run immediately rather than skip the slot, since a late
+    measurement is better than a lost datapoint. Subsequent slots stay
+    anchored to absolute time, so an overrun affects only the runs it
+    actually displaces and the schedule self-heals as soon as a run
+    fits inside its slot again.
+    """
+    target = anchor + interval * run_idx
+    return (target - now).total_seconds()
+
+
 def _due_status(
     query: RankQuery, delay: timedelta, now: datetime,
 ) -> tuple[bool, str]:
@@ -389,18 +405,27 @@ async def run(manifest: Manifest) -> None:
     job_summary = ", ".join(f"{j.name}({j.mode.value})" for j in jobs)
     _log(f"jobs: {len(jobs)} (parallel) — {job_summary}")
 
-    # Honor scheduled start time — block until then so a manifest
-    # configured for "run at 04:00" doesn't fire the moment ranker
-    # launches at 02:30. Past start times pass through (run now).
-    if isinstance(manifest.schedule.start, datetime):
-        now = datetime.now(timezone.utc)
-        if manifest.schedule.start > now:
-            wait_s = (manifest.schedule.start - now).total_seconds()
-            _log(
-                f"waiting for schedule.start {manifest.schedule.start.isoformat()} "
-                f"(in {int(wait_s / 60)}m {int(wait_s % 60)}s)"
-            )
-            await asyncio.sleep(wait_s)
+    # Cadence anchor — the absolute reference point from which every run
+    # slot is measured. Run N is scheduled to start at
+    # ``anchor + N * interval`` regardless of how long previous runs
+    # took. An overrunning run displaces only the slots it actually
+    # passes through; subsequent slots remain on their absolute marks,
+    # so the schedule self-heals once a run fits inside its window.
+    #
+    # Anchor selection:
+    # - future-dated start → anchor = start (block until it arrives)
+    # - "immediate" or past start → anchor = now (cadence begins on launch)
+    now = datetime.now(timezone.utc)
+    if isinstance(manifest.schedule.start, datetime) and manifest.schedule.start > now:
+        cadence_anchor = manifest.schedule.start
+        wait_s = (cadence_anchor - now).total_seconds()
+        _log(
+            f"waiting for schedule.start {cadence_anchor.isoformat()} "
+            f"(in {int(wait_s / 60)}m {int(wait_s % 60)}s)"
+        )
+        await asyncio.sleep(wait_s)
+    else:
+        cadence_anchor = now
 
     output_lock = asyncio.Lock()
 
@@ -413,6 +438,29 @@ async def run(manifest: Manifest) -> None:
 
         try:
             for run_idx in range(total_runs):
+                # Wait until this run's absolute slot. Run 0's slot is
+                # the anchor itself (delta == 0); later runs may need to
+                # sleep, or — if a previous run overran — log a warning
+                # and start late. We never skip a slot.
+                if run_idx > 0:
+                    delta = _slot_delay(
+                        cadence_anchor, interval, run_idx,
+                        datetime.now(timezone.utc),
+                    )
+                    target_iso = (cadence_anchor + interval * run_idx).isoformat()
+                    if delta > 0:
+                        _log(
+                            f"sleeping {int(delta)}s until run "
+                            f"{run_idx + 1}/{total_runs} at {target_iso}"
+                        )
+                        await asyncio.sleep(delta)
+                    else:
+                        _log(
+                            f"⚠ run {run_idx + 1}/{total_runs} starting "
+                            f"{int(-delta)}s late (previous run overran the "
+                            f"{int(interval.total_seconds())}s slot)"
+                        )
+
                 _log(f"run {run_idx + 1}/{total_runs}")
                 # Apply the overwrite policy ONCE per run before Jobs
                 # spawn — concurrent Jobs all use append semantics so they
@@ -439,10 +487,6 @@ async def run(manifest: Manifest) -> None:
                             f"⚠ job {job.name} failed: "
                             f"{type(outcome).__name__}: {outcome}"
                         )
-
-                if run_idx < total_runs - 1:
-                    _log(f"sleeping {int(interval.total_seconds())}s until next run")
-                    await asyncio.sleep(interval.total_seconds())
         finally:
             # Ctrl-C kills the driver before these run; suppressing the
             # inevitable "Connection closed" noise keeps exits clean.

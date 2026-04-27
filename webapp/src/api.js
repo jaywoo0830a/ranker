@@ -57,3 +57,17 @@ export async function getJobLogs(id, { tail } = {}) {
 export function jobResultUrl(id) {
   return `${API_BASE}/api/jobs/${id}/result`
 }
+
+// WebSocket URL for the live log stream. Picks ws:// or wss:// to match
+// the page's protocol so deployments behind HTTPS upgrade automatically.
+// In dev, Vite proxies the WS upgrade to the FastAPI server (see
+// vite.config.js, ``ws: true``).
+export function jobLogsStreamUrl(id) {
+  if (API_BASE) {
+    // Explicit base override (e.g. cross-origin staging) — swap the
+    // http(s) prefix for the matching ws(s) prefix.
+    return `${API_BASE.replace(/^http/, 'ws')}/api/jobs/${id}/logs/stream`
+  }
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${window.location.host}/api/jobs/${id}/logs/stream`
+}
